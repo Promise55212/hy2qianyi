@@ -1,0 +1,2213 @@
+#!/usr/bin/env python3
+"""Two-VPS hy2jieshu handover. The release runs from a private directory in /run."""
+
+import argparse
+import base64
+import contextlib
+import copy
+from dataclasses import asdict, dataclass
+import datetime as dt
+import fcntl
+import getpass
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import time
+from types import ModuleType
+from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.request import urlopen
+
+
+FORMAT = 2
+MAX_PACKET = 32 * 1024 * 1024
+MAX_STATE_FILE = 1024 * 1024
+SSH_FRAME = re.compile(rb"HY2SSH1 ([1-9][0-9]{0,8}) ([0-9a-f]{64})\n")
+MAX_SSH_PREAMBLE = 8192
+SOURCE_URL = "https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py"
+STATE = "/var/lib/hy2"
+LOCK_DIR = "/run/hy2"
+XRAY_DIR = "/etc/hysteria"
+XRAY = "/usr/local/bin/hysteria"
+SYSTEMD = "/etc/systemd/system"
+LIB = "/usr/local/lib/hy2"
+SBIN = "/usr/local/sbin"
+MAIN_FILES = {
+    "meta": f"{STATE}/main/main.env",
+    "config": f"{XRAY_DIR}/main.yaml",
+    "password": f"{STATE}/main/main.password",
+    "url": "/root/hy2_main_url.txt",
+}
+MAIN_SUB = "/root/hy2_main_subscription_base64.txt"
+MAIN_DEFAULTS = "/etc/default/hy2-main"
+JOURNAL = f"{STATE}/.hy2qianyi-recovery.json"
+TRAFFIC_PROGRAM = "/usr/local/sbin/hy2_traffic"
+TRAFFIC_SHA256 = "7fb3904d95d3b4e59f03662c7dbc107749380dc4422e8fba218b1631eb824de4"
+TRAFFIC_URL = "https://raw.githubusercontent.com/liucong552-art/hy2jieshu/ca4569d1192da6ad6ba1530faeb0b01815935bc0/traffic.py"
+TRAFFIC_TABLE = "hy2_daily_traffic"
+TRAFFIC_UNITS = {
+    "hy2-traffic.service": """[Unit]
+Description=Collect daily HY2 traffic
+After=local-fs.target nftables.service hy2-managed-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hy2_traffic --collect
+TimeoutStartSec=120
+UMask=0077
+""",
+    "hy2-traffic.timer": """[Unit]
+Description=Collect and prune daily HY2 traffic every minute
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+""",
+    "hy2-traffic-shutdown.service": """[Unit]
+Description=Save daily HY2 traffic before shutdown
+After=local-fs.target nftables.service hy2-managed-restore.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/hy2_traffic --collect
+TimeoutStopSec=120
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+""",
+}
+TRAFFIC_ENABLED = ("hy2-traffic-shutdown.service", "hy2-traffic.timer")
+MAX_BANS = 4096
+PROFILE = (
+    f"{LIB}/common.sh",
+    f"{LIB}/quota-lib.sh",
+    f"{LIB}/iplimit-lib.sh",
+    f"{SBIN}/hy2_run_temp.sh",
+    f"{SBIN}/hy2_cleanup_one.sh",
+    f"{SBIN}/hy2_temp_sub.sh",
+)
+NAT_PROFILE = f"{SBIN}/hy2_nat_preflight.sh"
+LEGACY = {}
+
+TAG = re.compile(r"hy2-temp-[A-Za-z0-9._-]{1,96}")
+IFACE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}")
+KEY = re.compile(r"[A-Z][A-Z0-9_]*")
+HEX = re.compile(r"[0-9a-f]{64}")
+FENCE = re.compile(r"hy2qianyi_[0-9a-f]{16}")
+
+
+class MigrationError(Exception):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise MigrationError(message)
+
+
+def exists(path):
+    return os.path.lexists(path)
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def unique_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "JSON 含重复字段")
+        value[key] = item
+    return value
+
+
+def decode_json(data):
+    return json.loads(data, object_pairs_hook=unique_keys)
+
+
+def encode_json(value):
+    return (json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+
+def secure_read(path, max_bytes=MAX_STATE_FILE):
+    path = Path(path)
+    require(path.resolve() == path, f"拒绝符号链接路径 {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                f"文件必须由 root 拥有且不可由其他用户写入 {path}")
+        require(info.st_size <= max_bytes, f"文件过大 {path}")
+        data = stream.read(max_bytes + 1)
+        require(len(data) <= max_bytes, f"文件过大 {path}")
+        return data
+
+
+def env_decode(data):
+    result = {}
+    for line in data.decode("utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, sep, val = line.partition("=")
+        require(sep and KEY.fullmatch(key) and key not in result, "节点元数据格式无效或字段重复")
+        result[key] = val
+    return result
+
+
+def env_encode(value):
+    return "".join(f"{key}={val}\n" for key, val in value.items()).encode()
+
+
+def validate_env(value):
+    require(isinstance(value, dict) and all(
+        KEY.fullmatch(key) and isinstance(val, str) and not any(ord(c) < 32 for c in val)
+        for key, val in value.items()
+    ), "节点元数据含无效字段")
+
+
+def number(raw, label, low=0, high=9_000_000_000_000_000_000):
+    require(isinstance(raw, str) and bool(re.fullmatch(r"0|[1-9][0-9]{0,18}", raw)), f"{label} 格式无效")
+    value = int(raw)
+    require(low <= value <= high, f"{label} 超出范围")
+    return value
+
+
+def mark_value(raw):
+    if isinstance(raw, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,8}", raw):
+        return int(raw, 16)
+    return number(raw, "MARK", 1, 2**32 - 1)
+
+
+def fsync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def pending_file(path):
+    return path.with_name(f".{path.name}.hy2qianyi-new")
+
+
+def write_file(path, data, mode=0o600):
+    path = Path(path)
+    require(path.resolve() == path and path.parent.is_dir(), f"写入目录缺失或为符号链接 {path.parent}")
+    temporary = pending_file(path)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def remove_file(path):
+    path = Path(path)
+    if exists(path):
+        path.unlink()
+        fsync_directory(path.parent)
+
+
+@dataclass
+class Node:
+    tag: str
+    port: int
+    meta: dict
+    config: str
+    url: str
+    quota: dict | None = None
+    iplimit: dict | None = None
+
+    @property
+    def main(self):
+        return self.tag == "main"
+
+    @property
+    def unit(self):
+        return "hy2.service" if self.main else f"{self.tag}.service"
+
+    @property
+    def expiry(self):
+        return 0 if self.main else number(self.meta.get("EXPIRE_EPOCH"), "EXPIRE_EPOCH", 1)
+
+    @property
+    def family(self):
+        return self.meta.get("IP_VERSION", "4")
+
+    @property
+    def nat(self):
+        return self.meta.get("LANDING") == "nat"
+
+    def paths(self):
+        if self.main:
+            return dict(MAIN_FILES, password=f"{STATE}/main/main.password")
+        return {
+            "meta": f"{STATE}/temp/{self.tag}.env",
+            "config": f"/etc/hysteria/temp/{self.tag}.yaml",
+            "url": f"{STATE}/temp/{self.tag}.url",
+            "unit": f"{SYSTEMD}/{self.unit}",
+        }
+
+
+def policy_paths(port):
+    return {"quota": f"{STATE}/quota/{port}.env", "iplimit": f"{STATE}/iplimit/{port}.env"}
+
+
+def main_defaults(raw, meta):
+    # Keep this machine's ACME account and core-update controls. Only the
+    # managed node's public identity and generated configuration are changed.
+    values = {key: meta[key] for key in (
+        "HY_DOMAIN", "HY_LISTEN", "MASQ_URL", "ENABLE_SALAMANDER", "SALAMANDER_PASSWORD",
+    )}
+    values.update(HY_IPV6_DOMAIN=meta.get("HY_IPV6_DOMAIN", ""),
+                  NODE_NAME=meta.get("NODE_NAME", "HY2-MAIN"))
+    lines = []
+    written = set()
+    for line in raw.decode("utf-8").splitlines():
+        match = re.match(r"^([ \t]*(?:export[ \t]+)?)([A-Z][A-Z0-9_]*)=", line)
+        if match and match[2] in values:
+            prefix, key = match.groups()
+            lines.append(f"{prefix}{key}={shlex.quote(values[key])}")
+            written.add(key)
+        else:
+            lines.append(line)
+    lines.extend(f"{key}={shlex.quote(val)}" for key, val in values.items() if key not in written)
+    return ("\n".join(lines) + "\n").encode()
+
+
+def validate_policies(node):
+    if not node.main:
+        quota = node.meta.get("PQ_LIMIT_BYTES", "")
+        require(bool(quota) == (node.quota is not None), f"端口 {node.port} 配额元数据不完整")
+        limit = number(node.meta.get("IP_LIMIT", "0"), "IP_LIMIT", 0, 65535)
+        require((limit > 0) == (node.iplimit is not None), f"端口 {node.port} IP 限制元数据不完整")
+    for policy in (node.quota, node.iplimit):
+        if policy is None:
+            continue
+        validate_env(policy)
+        require(policy.get("PORT") == str(node.port), f"端口 {node.port} 策略归属不符")
+        if node.main:
+            valid_owner = (policy.get("OWNER_KIND"), policy.get("OWNER_TAG", "")) in {
+                ("manual", ""), ("main", ""), ("main", "main"),
+            }
+        else:
+            valid_owner = (policy.get("OWNER_KIND"), policy.get("OWNER_TAG")) == ("temp", node.tag)
+        require(valid_owner, f"端口 {node.port} 策略归属不符")
+    if node.quota is not None:
+        total = number(node.quota.get("ORIGINAL_LIMIT_BYTES"), "ORIGINAL_LIMIT_BYTES", 1)
+        saved = number(node.quota.get("SAVED_USED_BYTES"), "SAVED_USED_BYTES", 0, total)
+        left = number(node.quota.get("LIMIT_BYTES"), "LIMIT_BYTES", 0, total)
+        require(saved + left == total and node.quota.get("REBUILD_PENDING", "0") == "0",
+                f"端口 {node.port} 配额处于异常或待恢复状态")
+        if not node.main:
+            require(total == number(quota, "PQ_LIMIT_BYTES"), f"端口 {node.port} 配额总额不符")
+        for field in ("RESET_INTERVAL_SECONDS", "NEXT_RESET_EPOCH", "EXPIRE_EPOCH"):
+            number(node.quota.get(field, "0"), field)
+    if node.iplimit is not None:
+        ip_count = number(node.iplimit.get("IP_LIMIT"), "IP_LIMIT", 1, 65535)
+        sticky = number(node.iplimit.get("IP_STICKY_SECONDS"), "IP_STICKY_SECONDS", 1, 2**31 - 1)
+        family = node.iplimit.get("IP_VERSION", "4")
+        expected = f"hy2_il{family}_{node.port}"
+        require(family == node.family and node.iplimit.get("SET_NAME", expected) == expected,
+                f"端口 {node.port} 的 IP 限制与节点不符")
+        if not node.main:
+            require(ip_count == limit and sticky == number(node.meta.get("IP_STICKY_SECONDS"), "IP_STICKY_SECONDS"),
+                    f"端口 {node.port} IP 限制数量或黏性时间不符")
+
+
+def validate_node(node):
+    require(isinstance(node.tag, str) and (node.main or TAG.fullmatch(node.tag)), "非法节点标识")
+    require(type(node.port) is int and 1 <= node.port <= 65535 and (node.port == 443) == node.main,
+            "443 必须是受管理主节点，临时节点端口必须不同")
+    validate_env(node.meta)
+    require(node.meta.get("STATE_SCHEMA") == "1", f"端口 {node.port} HY2 状态版本不支持")
+    port_key = "MAIN_PORT" if node.main else "PORT"
+    require(node.meta.get(port_key) == str(node.port), f"端口 {node.port} 与元数据不符")
+    require(node.family in ("4", "6") and (not node.main or node.family == "4"), "入站协议族无效")
+    if node.main:
+        require(not node.nat and node.meta.get("HY_LISTEN") == "0.0.0.0:443", "HY2 主节点监听配置不支持")
+    else:
+        require(node.meta.get("TAG") == node.tag and node.expiry > 0
+                and node.meta.get("LANDING") in ("local", "nat"), f"端口 {node.port} 临时节点元数据不符")
+
+    require(isinstance(node.config, str) and len(node.config.encode()) <= MAX_STATE_FILE,
+            f"端口 {node.port} HY2 配置格式无效")
+    try:
+        domain = node.meta["HY_DOMAIN"]
+        require(0 < len(domain) <= 253 and all(
+            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+            for label in domain.split(".")
+        ), f"端口 {node.port} TLS 域名格式无效")
+        cert = f"/etc/hysteria/certs/{domain}/fullchain.pem"
+        key = f"/etc/hysteria/certs/{domain}/privkey.pem"
+        password = node.meta["MAIN_PASSWORD" if node.main else "PASSWORD"]
+        require(0 < len(password) <= 4096, f"端口 {node.port} HY2 密码无效")
+        listen = "0.0.0.0:443" if node.main else (
+            f"[::]:{node.port}" if node.family == "6" else f"0.0.0.0:{node.port}"
+        )
+        if node.main:
+            require(node.meta.get("TLS_CERT") == cert and node.meta.get("TLS_KEY") == key
+                    and node.meta.get("MAIN_PASSWORD_FILE") == node.paths()["password"],
+                    "主节点证书或密码路径不标准，拒绝自动迁移")
+        else:
+            require(node.meta.get("LISTEN_ADDR") == listen, f"端口 {node.port} 监听地址与元数据不符")
+        enabled = node.meta["ENABLE_SALAMANDER"]
+        obfs = node.meta["SALAMANDER_PASSWORD"]
+        require(enabled in ("0", "1") and (enabled == "0" or bool(obfs)), "Salamander 配置无效")
+        masq = node.meta["MASQ_URL"]
+        proxy = urlsplit(masq)
+        require(proxy.scheme in ("http", "https") and proxy.hostname, "伪装地址无效")
+        iface = ""
+        if node.nat:
+            iface = node.meta["WG_IF"]
+            require(IFACE.fullmatch(iface), f"端口 {node.port} WireGuard 接口名无效")
+            require(mark_value(node.meta.get("MARK")) > 0, "WireGuard mark 不能为零")
+            table = number(node.meta.get("TABLE_ID"), "TABLE_ID", 1, 2**31 - 1)
+            require(table not in (253, 254, 255), "WireGuard 路由表保留值无效")
+            number(node.meta.get("RULE_PRIORITY"), "RULE_PRIORITY", 1, 32765)
+            number(node.meta.get("OIF_RULE_PRIORITY"), "OIF_RULE_PRIORITY", 1, 32765)
+            number(node.meta.get("HANDSHAKE_MAX"), "HANDSHAKE_MAX", 1, 86400)
+
+        # Match hy2_write_server_cfg byte for byte. Its quote helper uses YAML
+        # single quotes, doubling embedded apostrophes; do not parse arbitrary
+        # YAML (which could smuggle ACLs, resolvers, outbounds or inline ACME).
+        def quoted(value):
+            return "'" + value.replace("'", "''") + "'"
+
+        expected = (
+            f"listen: {quoted(listen)}\n\n"
+            f"tls:\n  cert: {quoted(cert)}\n  key: {quoted(key)}\n\n"
+            f"auth:\n  type: password\n  password: {quoted(password)}\n\n"
+        )
+        if enabled == "1":
+            expected += f"obfs:\n  type: salamander\n  salamander:\n    password: {quoted(obfs)}\n\n"
+        if iface:
+            expected += ("outbounds:\n  - name: nat\n    type: direct\n    direct:\n"
+                         f"      mode: 4\n      bindDevice: {quoted(iface)}\n\n")
+        expected += ("masquerade:\n  type: proxy\n  proxy:\n"
+                     f"    url: {quoted(masq)}\n    rewriteHost: true\n\n"
+                     "speedTest: false\ndisableUDP: false\nudpIdleTimeout: 60s\n")
+        require(node.config == expected, f"端口 {node.port} 包含自定义 HY2 配置或与元数据不符")
+
+        require(isinstance(node.url, str) and node.url.strip() == node.url and len(node.url) <= 8192
+                and all(ord(c) >= 32 for c in node.url), f"端口 {node.port} 链接格式无效")
+        url = urlsplit(node.url)
+        published = domain if node.main else node.meta["SERVER_ADDR"]
+        query = {"sni": [domain]}
+        if enabled == "1":
+            query.update(obfs=["salamander"], **{"obfs-password": [obfs]})
+        require(url.scheme == "hy2" and url.password is None and unquote(url.username or "") == password
+                and url.port == node.port and url.hostname == published.strip("[]").lower()
+                and url.path == "/" and parse_qs(url.query, keep_blank_values=True) == query,
+                f"端口 {node.port} 原链接与节点身份不符")
+        if node.main:
+            require(unquote(url.fragment) == node.meta.get("NODE_NAME", "HY2-MAIN"), "主节点链接名称与元数据不符")
+    except (KeyError, ValueError, AttributeError, TypeError, UnicodeError):
+        raise MigrationError(f"端口 {node.port} 的 HY2 配置或原链接格式异常") from None
+    validate_policies(node)
+    return node
+
+
+def plan_nodes(incoming, current):
+    """Port is the collision key. Preserve each original public HY2 URL."""
+    replaced = {n.port: current[n.port] for n in incoming if n.port in current}
+    occupied = {n.tag for port, n in current.items() if port not in replaced}
+    all_tags = occupied | {n.tag for n in incoming}
+    planned = []
+    for node in incoming:
+        if node.tag in occupied:
+            node = copy.deepcopy(node)
+            tag = f"hy2-temp-qy-{node.port}-{sha(node.tag.encode())[:12]}"
+            require(tag not in all_tags, f"端口 {node.port} 的目标内部节点标识已占用")
+            all_tags.add(tag)
+            node.tag = tag
+            node.meta.update(TAG=tag, ID=tag.removeprefix("hy2-temp-"))
+            for policy in (node.quota, node.iplimit):
+                if policy is not None:
+                    policy["OWNER_TAG"] = tag
+            print(f"端口 {node.port} 内部标识改为 {tag}，原链接保留。", flush=True)
+        planned.append(node)
+    return planned, replaced
+
+
+def unit_text(node):
+    require(not node.main, "临时服务生成器不能用于主节点")
+    paths = node.paths()
+    iface = node.meta.get("WG_IF", "")
+    dependency = f"Requisite=wg-quick@{iface}.service" if node.nat else ""
+    ordering = f"wg-quick@{iface}.service" if node.nat else ""
+    preflight = f"ExecStartPre={NAT_PROFILE} {node.tag}" if node.nat else ""
+    landing = "nat" if node.nat else "local"
+    return f"""[Unit]
+Description=Temporary Hysteria 2 {node.tag} ({landing})
+{dependency}
+After=network-online.target nftables.service hy2-managed-restore.service {ordering}
+Wants=network-online.target
+ConditionPathExists={paths['config']}
+ConditionPathExists={paths['meta']}
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+{preflight}
+ExecStart={SBIN}/hy2_run_temp.sh {node.tag} {paths['config']}
+ExecStopPost={SBIN}/hy2_cleanup_one.sh {node.tag} --from-stop-post
+Restart=on-failure
+RestartSec=3s
+SuccessExitStatus=0 124 143
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def parse_node(item):
+    require(isinstance(item, dict) and set(item) == {"tag", "port", "meta", "config", "url", "quota", "iplimit"},
+            "迁移包节点结构不支持")
+    return validate_node(Node(**item))
+
+
+def unique_nodes(nodes):
+    require(len({n.port for n in nodes}) == len(nodes) and len({n.tag for n in nodes}) == len(nodes),
+            "发现重复节点端口或标识")
+
+
+def daily_path():
+    return Path(STATE) / "traffic/daily.json"
+
+
+def daily_files():
+    return {Path(TRAFFIC_PROGRAM), daily_path()} | {Path(SYSTEMD) / name for name in TRAFFIC_UNITS}
+
+
+
+
+def portable_daily(record):
+    return {key: copy.deepcopy(record[key]) for key in ("tag", "port", "key", "days", "sampled_at")}
+
+
+def validate_daily_records(records, nodes):
+    by_tag = {node.tag: node for node in nodes}
+    require(isinstance(records, dict) and set(records) <= set(by_tag), "每日流量包含未迁移的节点")
+    for tag, record in records.items():
+        node = by_tag[tag]
+        require(isinstance(record, dict) and set(record) == {"tag", "port", "key", "days", "sampled_at"}
+                and record["tag"] == tag and type(record["port"]) is int and record["port"] == node.port
+                and record["key"] == daily_key(node), f"每日流量与端口 {node.port} 的节点身份不符")
+        require(isinstance(record["days"], dict) and len(record["days"]) <= 30, "每日流量日期条数异常")
+        for day, value in record["days"].items():
+            require(isinstance(day, str) and dt.date.fromisoformat(day).isoformat() == day
+                    and isinstance(value, dict) and set(value) == {"upload", "download"}
+                    and all(type(count) is int and 0 <= count <= 9_000_000_000_000_000_000
+                            for count in value.values()), f"端口 {node.port} 的每日流量数据异常")
+        require(isinstance(record["sampled_at"], str)
+                and dt.datetime.fromisoformat(record["sampled_at"]).tzinfo is not None,
+                f"端口 {node.port} 的每日流量采样时间异常")
+
+
+def validate_daily_payload(daily, nodes):
+    require(isinstance(daily, dict) and set(daily) == {"program_sha256", "users"}
+            and daily["program_sha256"] == TRAFFIC_SHA256, "每日流量组件版本不支持")
+    validate_daily_records(daily["users"], nodes)
+
+
+def validate_daily_plan(plan, new, old):
+    require(isinstance(plan, dict) and set(plan) == {"install", "directory_created", "program", "incoming", "before"}
+            and type(plan["install"]) is bool and type(plan["directory_created"]) is bool,
+            "每日流量恢复记录异常")
+    validate_daily_records(plan["incoming"], new)
+    validate_daily_records(plan["before"], old)
+    require(isinstance(plan["program"], str) and len(plan["program"]) <= MAX_STATE_FILE * 2
+            and sha(base64.b64decode(plan["program"], validate=True)) == TRAFFIC_SHA256,
+            "每日流量恢复程序校验失败")
+
+
+def daily_guard_units(plan):
+    return {"hy2-traffic.service", "hy2-traffic-shutdown.service"} if plan and plan["install"] else set()
+
+
+
+
+def ban_entries(rows, ports):
+    require(isinstance(rows, list) and len(rows) <= MAX_BANS, "黑名单清单超过大小限制或格式无效")
+    result = set()
+    for row in rows:
+        require(isinstance(row, list) and len(row) == 2, "黑名单清单格式无效")
+        entry = ban_entry(*row)
+        require(entry[0] in ports, f"黑名单包含本轮未迁移的端口 {entry[0]}")
+        result.add(entry)
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+def decode_bundle(packet):
+    bundle = decode_json(packet)
+    fields = {"format", "profile", "nodes", "origin"}
+    require(isinstance(bundle, dict) and set(bundle) - {"blacklist", "daily"} == fields
+            and bundle["format"] == FORMAT and isinstance(bundle["origin"], str) and HEX.fullmatch(bundle["origin"]),
+            "迁移包版本不支持")
+    require(isinstance(bundle["nodes"], list) and 1 <= len(bundle["nodes"]) <= 512
+            and isinstance(bundle["profile"], dict), "迁移包结构无效")
+    nodes = [parse_node(item) for item in bundle["nodes"]]
+    unique_nodes(nodes)
+    require(any(n.main for n in nodes), "迁移包缺少 443 主节点")
+    bans = ban_entries(bundle.get("blacklist", []), {node.port for node in nodes})
+    daily = bundle.get("daily")
+    if daily is not None:
+        validate_daily_payload(daily, nodes)
+    return bundle["origin"], bundle["profile"], nodes, bans, daily
+
+
+def normalized_unit(text):
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def guard_file(unit):
+    return Path(SYSTEMD) / f"{unit}.d" / "80-hy2qianyi-transaction.conf"
+
+
+
+
+def permit_file(table):
+    return Path(f"/run/{table}.permit")
+
+
+def guard_data(table):
+    return f"[Unit]\nConditionPathExists=|!{JOURNAL}\nConditionPathExists=|{permit_file(table)}\n".encode()
+
+
+class Host:
+    def __init__(self, work):
+        self.work = work
+
+    def run(self, *args, input_data=None, check=True, timeout=60, env=None):
+        command = [str(arg) for arg in args]
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in {"BASH_ENV", "ENV", "CDPATH"} and not key.startswith(("HY2_", "BASH_FUNC_"))}
+        environment.update(LC_ALL="C", PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        environment.update(env or {})
+        try:
+            result = subprocess.run(command, input=input_data, env=environment, text=True,
+                                    capture_output=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            raise MigrationError(f"命令不可用或执行超时 {Path(command[0]).name}") from None
+        require(not check or result.returncode == 0,
+                f"命令失败 {Path(command[0]).name} {' '.join(command[1:3])}（退出码 {result.returncode}）")
+        return result
+
+    @contextlib.contextmanager
+    def lock(self, *names):
+        with contextlib.ExitStack() as stack:
+            for name in names:
+                path = Path(LOCK_DIR) / name
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                stack.callback(os.close, fd)
+                info = os.fstat(fd)
+                require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                        f"无效的 hy2jieshu 锁 {name}")
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        require(time.monotonic() < deadline, f"hy2jieshu 锁繁忙 {name}")
+                        time.sleep(0.1)
+            yield
+
+    def temp_lock(self):
+        require(Path(LOCK_DIR).is_dir() and Path(LOCK_DIR).resolve() == Path(LOCK_DIR),
+                "缺少 hy2jieshu 运行目录，请先安装并启动 hy2jieshu")
+        return self.lock("temp.lock")
+
+
+
+
+
+    def identity(self):
+        raw = secure_read("/etc/machine-id").strip()
+        require(re.fullmatch(rb"[a-f0-9]{32}", raw) and raw != b"0" * 32, "本机 machine-id 无效")
+        return sha(raw)
+
+
+
+    def sys(self, *args, check=True, timeout=65):
+        return self.run("systemctl", *args, check=check, timeout=timeout)
+
+    def property(self, unit, name):
+        return self.sys("show", "--property", name, "--value", unit).stdout.strip()
+
+    def active(self, unit):
+        return self.sys("is-active", "--quiet", unit, check=False).returncode == 0
+
+    def enabled(self, unit):
+        state = self.sys("is-enabled", unit, check=False).stdout.strip()
+        require(state in {"enabled", "disabled"}, f"{unit} 启用状态异常 {state or '未知'}")
+        return state == "enabled"
+
+
+
+    def owns(self, unit, pids):
+        group = self.property(unit, "ControlGroup")
+        if not group:
+            return False
+        for pid in pids:
+            try:
+                groups = [line.split(":", 2)[-1] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines()]
+            except FileNotFoundError:
+                return False
+            if not any(path == group or path.startswith(group + "/") for path in groups):
+                return False
+        return True
+
+    def inspect_owners(self, ports, nodes):
+        listeners = self.listeners(ports)
+        for port, pids in listeners.items():
+            node = nodes.get(port)
+            require(node is not None and self.owns(node.unit, pids),
+                    f"端口 {port} 被其他服务占用，拒绝停止或覆盖")
+        return listeners
+
+    def capture_quota(self, node):
+        if node.quota is None:
+            return
+        status, total, used, left = self.native('hy2_pq_snapshot_unlocked "$1"', node.port).split("|")
+        require(status in {"active", "exhausted"} and total == node.quota["ORIGINAL_LIMIT_BYTES"],
+                f"端口 {node.port} 实时配额读取失败或保护状态异常")
+        node.quota.update(SAVED_USED_BYTES=used, LIMIT_BYTES=left, LAST_SAVE_EPOCH=str(int(time.time())))
+        validate_policies(node)
+
+    def policy_state(self, node):
+        if node.quota is not None:
+            status = self.native('hy2_pq_snapshot_unlocked "$1"', node.port).split("|", 1)[0]
+            require(status in {"active", "exhausted"}, f"端口 {node.port} 配额规则未就绪")
+        if node.iplimit is not None:
+            require(self.native('hy2_il_state "$1"', node.port) == "active", f"端口 {node.port} IP 限制未就绪")
+        elif not node.main:
+            require(self.native('hy2_il_family_guard_state "$1"', node.port) == "active",
+                    f"端口 {node.port} 协议族隔离未就绪")
+
+    def capture_ip_slots(self, node):
+        if node.iplimit is None:
+            return []
+        name = f"hy2_il{node.family}_{node.port}"
+        data = decode_json(self.run("nft", "-j", "list", "set", "inet", "hy2_iplimit", name).stdout)
+        entry, = [item["set"] for item in data["nftables"] if "set" in item and item["set"]["name"] == name]
+        now = int(time.time())
+        slots = []
+        for item in entry.get("elem", []):
+            require(isinstance(item, dict) and "elem" in item,
+                    f"端口 {node.port} 的 IP 黏性集合格式不支持")
+            elem = item["elem"]
+            address = ipaddress.ip_address(elem["val"])
+            seconds = elem.get("expires")
+            require(address.version == int(node.family) and type(seconds) is int and seconds >= 0,
+                    f"端口 {node.port} 的 IP 黏性集合格式不支持")
+            if seconds:
+                slots.append([str(address), now + seconds])
+        return slots
+
+    def restore_ip_slots(self, node, slots):
+        if not slots:
+            return
+        require(node.iplimit is not None, f"端口 {node.port} 恢复材料缺少 IP 限制")
+        now = int(time.time())
+        commands = []
+        for value, until in slots:
+            address = ipaddress.ip_address(value)
+            require(address.version == int(node.family) and type(until) is int, "恢复 IP 黏性集合格式无效")
+            remaining = min(until - now, int(node.iplimit["IP_STICKY_SECONDS"]))
+            if remaining > 0:
+                commands.append(f"add element inet hy2_iplimit hy2_il{node.family}_{node.port} "
+                                f"{{ {address} timeout {remaining}s }}")
+        if commands:
+            self.nft("\n".join(commands))
+
+    def tables(self):
+        data = decode_json(self.run("nft", "-j", "list", "tables").stdout)
+        return {item["table"]["name"] for item in data["nftables"]
+                if "table" in item and item["table"].get("family") == "inet"}
+
+    def check_optional_policies(self, ports):
+        tables = self.tables()
+        paused = {port for port in ports if f"pause_hy2_{port}" in tables}
+        bandwidth = {port for port in ports if exists(f"/var/lib/portbw/ports/{port}.json")}
+        if "pbw_policy" in tables:
+            raw = self.run("nft", "-n", "list", "table", "inet", "pbw_policy").stdout
+            bandwidth |= ports & {int(port) for port in re.findall(r'comment "pbw-(\d+)-', raw)}
+        require(not (paused or bandwidth),
+                f"待迁端口有独立策略，须先单独处理。暂停 {sorted(paused)}，portbw {sorted(bandwidth)}")
+
+
+
+
+
+
+
+
+
+
+    def nft(self, commands):
+        self.run("nft", "-f", "-", input_data=commands + "\n")
+
+    def fence(self, table, ports):
+        numbers = ", ".join(map(str, sorted(ports)))
+        self.nft(f"""create table inet {table}
+add chain inet {table} inbound {{ type filter hook input priority -120; policy accept; }}
+add chain inet {table} outbound {{ type filter hook output priority -120; policy accept; }}
+add rule inet {table} inbound udp dport {{ {numbers} }} drop
+add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
+
+    def unfence(self, table):
+        if table in self.tables():
+            self.nft(f"delete table inet {table}")
+        require(table not in self.tables(), f"临时防护表仍存在 {table}")
+
+    def guard_units(self, table, units):
+        for unit in sorted(units):
+            path = guard_file(unit)
+            require(path.parent.resolve() == path.parent, f"服务保护目录为符号链接 {unit}")
+            if not path.parent.exists():
+                path.parent.mkdir(mode=0o755)
+                fsync_directory(path.parent.parent)
+            if exists(path):
+                require(secure_read(path) == guard_data(table), f"服务已有未知保护 {unit}")
+            else:
+                write_file(path, guard_data(table), 0o644)
+        self.sys("daemon-reload")
+
+    def permit_units(self, table):
+        path = permit_file(table)
+        if exists(path):
+            require(secure_read(path) == b"hy2qianyi\n", "启动许可文件归属异常")
+        else:
+            write_file(path, b"hy2qianyi\n")
+
+    def clear_guards(self, table, units):
+        for unit in sorted(units):
+            path = guard_file(unit)
+            if exists(path):
+                require(secure_read(path) == guard_data(table), f"服务保护文件归属异常 {unit}")
+                remove_file(path)
+            if path.parent.is_dir():
+                path.parent.rmdir()
+                fsync_directory(path.parent.parent)
+        self.sys("daemon-reload")
+        remove_file(permit_file(table))
+
+    def clear_policies(self, ports):
+        self.native('for port; do hy2_pq_delete_managed_port "$port"; hy2_il_delete_managed_port "$port"; done',
+                    *sorted(ports))
+
+
+    def remove_temp_nodes(self, nodes):
+        for node in nodes:
+            if not node.main:
+                for path in node.paths().values():
+                    remove_file(path)
+
+
+    def wait_ready(self, nodes):
+        by_port = {node.port: node for node in nodes}
+        if not by_port:
+            return
+        deadline = time.monotonic() + 25
+        stable = 0
+        while time.monotonic() < deadline:
+            listening = self.inspect_owners(set(by_port), by_port)
+            if all(port in listening and self.active(node.unit) for port, node in by_port.items()):
+                stable += 1
+                if stable == 3:
+                    return
+            else:
+                stable = 0
+            time.sleep(1)
+        raise MigrationError("等待节点稳定监听超时，请查看目标机对应的 systemd 服务")
+
+    def daily_module(self, program):
+        require(sha(program) == TRAFFIC_SHA256, "hy2_traffic 版本不支持，请先对齐原生统计组件")
+        module = ModuleType("hy2qianyi_native_daily")
+        module.__file__ = TRAFFIC_PROGRAM
+        exec(compile(program, TRAFFIC_PROGRAM, "exec"), module.__dict__)
+        module.STATE = Path(STATE)
+        module.PROGRAM = Path(TRAFFIC_PROGRAM)
+        module.UNIT_DIR = Path(SYSTEMD)
+        return module
+
+    def collect_daily(self, module):
+        # The caller holds temp.lock, also taken by every native collector entry.
+        path = daily_path()
+        require(path.resolve() == path, "每日流量状态路径为符号链接")
+        if exists(path):
+            secure_read(path, MAX_PACKET)
+        try:
+            return module.collect(root=Path(STATE))
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
+            raise MigrationError("每日流量采集失败，请先检查原生 hy2_traffic 是否能正常运行") from None
+
+
+    def prepare_daily(self, daily, incoming, nodes):
+        installed = exists(TRAFFIC_PROGRAM)
+        if installed:
+            program = secure_read(TRAFFIC_PROGRAM)
+        else:
+            require(not exists(daily_path()) and TRAFFIC_TABLE not in self.tables(),
+                    "目标机有每日流量残留但缺少原生统计程序，请先检查")
+            for name in TRAFFIC_UNITS:
+                path = Path(SYSTEMD) / name
+                require(not exists(path) and not exists(path.parent / f"{name}.d")
+                        and self.property(name, "LoadState") == "not-found",
+                        f"目标机已有无法归属的每日流量服务 {name}")
+            try:
+                with urlopen(TRAFFIC_URL, timeout=25) as response:
+                    program = response.read(MAX_STATE_FILE + 1)
+            except OSError:
+                raise MigrationError("目标机下载原生每日流量组件失败，请检查 GitHub 网络") from None
+        self.daily_module(program)
+        paths = daily_files() if not installed else {daily_path()}
+        for path in paths:
+            require(path.resolve() == path and not exists(pending_file(path)),
+                    f"每日流量路径异常或有未完成写入 {path}")
+        records = {}
+        for original, node in zip(incoming, nodes, strict=True):
+            if original.tag in daily["users"]:
+                record = copy.deepcopy(daily["users"][original.tag])
+                record.update(tag=node.tag, port=node.port, key=daily_key(node))
+                records[node.tag] = record
+        validate_daily_records(records, nodes)
+        return {"install": not installed, "directory_created": not daily_path().parent.exists(),
+                "program": base64.b64encode(program).decode(), "incoming": records, "before": {}}
+
+    def capture_daily_before(self, plan, old):
+        if not plan["install"]:
+            module = self.daily_module(base64.b64decode(plan["program"], validate=True))
+            state = self.collect_daily(module)
+            plan["before"] = {node.tag: portable_daily(state["users"][node.tag]) for node in old
+                              if node.tag in state["users"]}
+            validate_daily_records(plan["before"], old)
+
+    def merge_daily(self, plan, records):
+        module = self.daily_module(base64.b64decode(plan["program"], validate=True))
+        state = self.collect_daily(module)
+        for tag, saved in records.items():
+            record = state["users"].get(tag)
+            if record is not None:
+                require(record["key"] == saved["key"] and record["port"] == saved["port"],
+                        f"每日流量节点归属在迁移期间改变 {tag}")
+                # Keep the just-collected target baselines. Source counter names
+                # and byte baselines are never attached to the destination.
+                record["days"] = copy.deepcopy(saved["days"])
+        now = dt.datetime.now(module.TZ)
+        module.prune(state, module.discover(Path(STATE), now), now.date())
+        module.save_state(daily_path(), state)
+
+    def apply_daily(self, plan):
+        if plan["install"]:
+            write_file(TRAFFIC_PROGRAM, base64.b64decode(plan["program"], validate=True), 0o755)
+            for name, content in TRAFFIC_UNITS.items():
+                write_file(Path(SYSTEMD) / name, content.encode(), 0o644)
+        self.merge_daily(plan, plan["incoming"])
+        self.verify_daily(plan)
+
+    def verify_daily(self, plan):
+        module = self.daily_module(secure_read(TRAFFIC_PROGRAM))
+        state = module.load_state(daily_path())
+        now = dt.datetime.now(module.TZ)
+        nodes = module.discover(Path(STATE), now)
+        cutoff = (now.date() - dt.timedelta(days=29)).isoformat()
+        today = now.date().isoformat()
+        for tag, saved in plan["incoming"].items():
+            if tag not in nodes:
+                continue
+            actual = state["users"].get(tag)
+            require(actual is not None and actual["key"] == nodes[tag]["key"] == saved["key"],
+                    f"每日流量没有正确接续节点 {tag}")
+            for day, count in saved["days"].items():
+                if cutoff <= day <= today:
+                    require(day in actual["days"] and all(actual["days"][day][key] >= value
+                            for key, value in count.items()), f"每日流量历史不完整 {tag}")
+
+    def finish_daily(self, plan):
+        self.verify_daily(plan)
+        if plan["install"]:
+            for name, content in TRAFFIC_UNITS.items():
+                require(secure_read(Path(SYSTEMD) / name) == content.encode(), "每日流量服务归属异常")
+            self.sys("enable", *TRAFFIC_ENABLED)
+            self.sys("start", *TRAFFIC_ENABLED)
+            require(all(self.active(unit) for unit in TRAFFIC_ENABLED), "每日流量自动采集未启动")
+
+    def restore_daily(self, plan):
+        if not plan["install"]:
+            self.merge_daily(plan, plan["before"])
+            return
+        require(not any(self.active(unit) for unit in TRAFFIC_UNITS),
+                "新装的每日流量组件被外部启动，请检查后再恢复")
+        for name, content in TRAFFIC_UNITS.items():
+            path = Path(SYSTEMD) / name
+            if exists(path):
+                require(secure_read(path) == content.encode(), f"每日流量服务归属异常 {name}")
+                if name in TRAFFIC_ENABLED:
+                    self.sys("disable", name)
+                remove_file(path)
+        if exists(TRAFFIC_PROGRAM):
+            require(sha(secure_read(TRAFFIC_PROGRAM)) == TRAFFIC_SHA256, "每日流量程序被外部改动")
+            remove_file(TRAFFIC_PROGRAM)
+        if TRAFFIC_TABLE in self.tables():
+            self.nft(f"delete table inet {TRAFFIC_TABLE}")
+        if exists(daily_path()):
+            secure_read(daily_path(), MAX_PACKET)
+            remove_file(daily_path())
+        if plan["directory_created"] and daily_path().parent.is_dir():
+            daily_path().parent.rmdir()
+            fsync_directory(daily_path().parent.parent)
+        self.sys("daemon-reload")
+
+    def legacy(self, *, remove=False):
+        for path, digest in LEGACY.items():
+            if exists(path):
+                require(sha(secure_read(path)) == digest, f"旧迁移脚本 {path} 内容不匹配，请确认归属后处理")
+                if remove:
+                    remove_file(path)
+
+
+class Hy2Host(Host):
+    """HY2 native filesystem and runtime adapter; never copies WireGuard keys."""
+
+    def policy_lock(self):
+        return self.lock("quota.lock", "iplimit.lock")
+
+    def native(self, script, *args):
+        preamble = f"""set -Eeuo pipefail
+source {LIB}/common.sh
+source {LIB}/quota-lib.sh
+source {LIB}/iplimit-lib.sh
+"""
+        return self.run("/bin/bash", "-c", preamble + script, "hy2qianyi", *args,
+                        env={"HY2_TEMP_LOCK_HELD": "1", "HY2_PQ_LOCK_HELD": "1",
+                             "HY2_IL_LOCK_HELD": "1"}).stdout.strip()
+
+    def profile(self, nat):
+        paths = (*PROFILE, NAT_PROFILE) if nat else PROFILE
+        result = {path: sha(secure_read(path)) for path in paths}
+        require(os.access(XRAY, os.X_OK), "缺少可执行的 Hysteria 核心")
+        return result
+
+    def inventory(self):
+        nodes = {}
+        for path in sorted((Path(STATE) / "temp").glob("hy2-temp-*.env")):
+            require(TAG.fullmatch(path.stem), f"非法 HY2 节点文件 {path.name}")
+            meta = env_decode(secure_read(path))
+            port = number(meta.get("PORT"), "PORT", 1, 65535)
+            require(meta.get("TAG") == path.stem and port not in nodes and port != 443,
+                    f"HY2 临时节点归属异常或端口重复 {path.name}")
+            nodes[port] = Node(path.stem, port, meta, "", "")
+        main = env_decode(secure_read(MAIN_FILES["meta"]))
+        require(main.get("MAIN_PORT") == "443", "两台机器都须已有标准 HY2 的 443 主节点")
+        nodes[443] = Node("main", 443, main, "", "")
+        return nodes
+
+    def read_node(self, entry):
+        paths = entry.paths()
+        config = secure_read(paths["config"]).decode("utf-8")
+        url = secure_read(paths["url"]).decode("utf-8").rstrip("\n")
+        meta = dict(entry.meta)
+        if entry.main:
+            password_path = MAIN_FILES.get("password", f"{STATE}/main/main.password")
+            password = secure_read(password_path).decode("utf-8").strip()
+            require(password and password == meta.get("MAIN_PASSWORD"), "主密码文件与 HY2 元数据不一致")
+        rules = {name: env_decode(secure_read(path)) if exists(path) else None
+                 for name, path in policy_paths(entry.port).items()}
+        return validate_node(Node(entry.tag, entry.port, meta, config, url, **rules))
+
+    def check_unit(self, node):
+        path = f"{SYSTEMD}/{node.unit}"
+        installed = secure_read(path).decode("utf-8")
+        require(self.property(node.unit, "FragmentPath") == path and not self.property(node.unit, "DropInPaths"),
+                f"{node.unit} 存在自定义路径或 drop-in，拒绝替换")
+        if node.main:
+            expected = f"""[Unit]
+Description=Managed Hysteria 2 Main Service
+After=network-online.target nftables.service hy2-managed-restore.service
+Wants=network-online.target
+ConditionPathExists={MAIN_FILES['config']}
+StartLimitIntervalSec=300
+StartLimitBurst=10
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart={XRAY} server -c {MAIN_FILES['config']}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1000000
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+"""
+        else:
+            expected = unit_text(node)
+        require(normalized_unit(installed) == normalized_unit(expected),
+                f"{node.unit} 不是受支持的标准 HY2 服务")
+
+    def listeners(self, ports):
+        ports = set(ports)
+        # Guard policies affect TCP and UDP; never fence an SSH or other TCP listener.
+        for line in self.run("ss", "-H", "-ltnp").stdout.splitlines():
+            columns = line.split()
+            local = columns[3].rpartition(":")[2] if len(columns) >= 4 else ""
+            require(not local.isdecimal() or int(local) not in ports,
+                    f"迁移端口 {local} 上有 TCP 业务，拒绝修改")
+        result = {}
+        for line in self.run("ss", "-H", "-lunp").stdout.splitlines():
+            columns = line.split()
+            local = columns[3].rpartition(":")[2] if len(columns) >= 4 else ""
+            if not local.isdecimal() or int(local) not in ports:
+                continue
+            port = int(local)
+            pids = {int(pid) for pid in re.findall(r"\bpid=(\d+)\b", line)}
+            require(pids, f"UDP 端口 {port} 监听者归属未知")
+            result.setdefault(port, set()).update(pids)
+        return result
+
+    def check_optional_policies(self, ports):
+        super().check_optional_policies(ports)
+        state_path = Path(STATE) / "manual-guard/state.json"
+        paused = set()
+        if exists(state_path):
+            data = decode_json(secure_read(state_path))
+            require(isinstance(data, dict) and data.get("schema") == 1
+                    and isinstance(data.get("paused"), list) and isinstance(data.get("bans"), dict),
+                    "HY2 手动防护持久状态损坏")
+            require(all(type(port) is int and 1 <= port <= 65535 for port in data["paused"]),
+                    "HY2 手动防护暂停端口无效")
+            paused |= set(data["paused"])
+        if "hy2_manual_guard" in self.tables():
+            raw = self.run("nft", "-n", "list", "table", "inet", "hy2_manual_guard").stdout
+            paused |= {int(port) for port in re.findall(r'comment "hy2-guard-pause:(\d+)"', raw)}
+        require(not ports & paused, f"迁入端口存在手动暂停策略 {sorted(ports & paused)}，请先处理")
+
+    def adapt_nat(self, node):
+        if not node.nat:
+            return
+        iface = node.meta["WG_IF"]
+        require(IFACE.fullmatch(iface), "WireGuard 接口名无效")
+        settings = env_decode(secure_read(f"/etc/wireguard/{iface}.env"))
+        mark = mark_value(settings.get("MARK"))
+        table = number(settings.get("TABLE_ID"), "TABLE_ID", 1, 2**31 - 1)
+        priority = number(settings.get("RULE_PRIORITY"), "RULE_PRIORITY", 2, 32765)
+        oif_priority = str(priority - 1)
+        # Reuse a managed target binding if one already differs from the default.
+        bound = {item.meta.get("OIF_RULE_PRIORITY", oif_priority) for item in self.inventory().values()
+                 if item.nat and item.meta.get("WG_IF") == iface}
+        require(len(bound) <= 1, "目标 WireGuard 接口的 HY2 oif 优先级不一致")
+        if bound:
+            oif_priority = bound.pop()
+        number(oif_priority, "OIF_RULE_PRIORITY", 1, 32765)
+        require(table not in (253, 254, 255) and self.active(f"wg-quick@{iface}.service"),
+                f"目标 WireGuard {iface} 未运行")
+        require(self.active(f"wg-nat-guard@{iface}.timer") and self.enabled(f"wg-nat-guard@{iface}.timer"),
+                f"目标 WireGuard {iface} 缺少已运行的 fail-closed 定时保护")
+        routes = decode_json(self.run("ip", "-j", "-4", "route", "show", "table", str(table)).stdout)
+        require(any(row.get("dst") == "default" and row.get("dev") == iface
+                    and row.get("type", "unicast") == "unicast" for row in routes)
+                and any(row.get("dst") == "default" and row.get("type") == "prohibit" for row in routes),
+                f"目标 WireGuard {iface} 路由缺少正常或 prohibit 默认路由")
+        rules = decode_json(self.run("ip", "-j", "-4", "rule", "show").stdout)
+        require(any(row.get("oif") == iface and str(row.get("table")) == str(table)
+                    and str(row.get("priority")) == oif_priority for row in rules),
+                f"目标 WireGuard {iface} 缺少 HY2 oif 规则，请先建立一个目标 WG-NAT 节点并验收")
+        for attempt in range(5):
+            query = self.run("ip", "-j", "-4", "route", "get", "1.1.1.1", "oif", iface, check=False)
+            route = decode_json(query.stdout) if query.returncode == 0 else []
+            if route and route[0].get("dev") == iface:
+                break
+            if attempt < 4:
+                time.sleep(0.5)
+        require(query.returncode == 0 and route and route[0].get("dev") == iface,
+                f"目标 WireGuard {iface} 的 oif 路由未就绪")
+        allowed = self.run("wg", "show", iface, "allowed-ips").stdout.splitlines()
+        defaults = {parts[0] for row in allowed if len(parts := row.split()) >= 2
+                    and "0.0.0.0/0" in " ".join(parts[1:]).replace(",", " ").split()}
+        require(len(defaults) == 1, "目标 WireGuard 缺少唯一默认 IPv4 出口 Peer")
+        rows = self.run("wg", "show", iface, "latest-handshakes").stdout.splitlines()
+        stamps = [int(parts[1]) for row in rows if len(parts := row.split()) == 2
+                  and parts[0] in defaults and parts[1].isdecimal()]
+        recent = max(stamps, default=0)
+        max_age = number(node.meta.get("HANDSHAKE_MAX", "180"), "HANDSHAKE_MAX", 1, 86400)
+        require(recent > 0 and 0 <= int(time.time()) - recent <= max_age,
+                "目标 WireGuard 默认出口 Peer 的握手在未来、过旧或从未成功")
+        node.meta.update(MARK=str(mark), TABLE_ID=str(table), RULE_PRIORITY=str(priority),
+                         OIF_RULE_PRIORITY=oif_priority)
+
+    def test_config(self, node):
+        validate_node(node)
+        target = self.inventory()[443].meta
+        require(target.get("HY_DOMAIN") == node.meta.get("HY_DOMAIN"),
+                "目标机主域名必须与源节点 HY_DOMAIN 一致，请先在目标部署同域证书及续期配置")
+        domain = node.meta["HY_DOMAIN"]
+        cert = f"/etc/hysteria/certs/{domain}/fullchain.pem"
+        key = f"/etc/hysteria/certs/{domain}/privkey.pem"
+        secure_read(cert)
+        secure_read(key)
+        self.run("openssl", "x509", "-in", cert, "-noout", "-checkend", "0", "-checkhost", domain)
+        extensions = self.run("openssl", "x509", "-in", cert, "-noout", "-ext", "subjectAltName").stdout
+        names = {name.lower() for name in re.findall(r"DNS:([^,\s]+)", extensions)}
+        require(domain.lower() in names or any(name.startswith("*.")
+                    and domain.lower().split(".", 1)[-1] == name[2:]
+                    and len(domain.split(".")) == len(name.split(".")) for name in names),
+                "目标 TLS 证书的 SAN 未覆盖 HY_DOMAIN")
+        public_cert = self.run("openssl", "x509", "-in", cert, "-pubkey", "-noout").stdout.strip()
+        public_key = self.run("openssl", "pkey", "-in", key, "-pubout").stdout.strip()
+        require(public_cert and public_cert == public_key, "目标 TLS 证书与私钥不配对")
+        path = self.work / "check.yaml"
+        try:
+            listen = node.meta["HY_LISTEN"] if node.main else node.meta["LISTEN_ADDR"]
+            password = node.meta["MAIN_PASSWORD"] if node.main else node.meta["PASSWORD"]
+            self.native('hy2_write_server_cfg "$@"', path, listen, password, cert, key,
+                        node.meta["MASQ_URL"], node.meta.get("ENABLE_SALAMANDER", "0"),
+                        node.meta.get("SALAMANDER_PASSWORD", ""),
+                        node.meta["WG_IF"] if node.nat else "", "4")
+            require(secure_read(path).decode("utf-8") == node.config,
+                    f"端口 {node.port} 配置不是当前标准 HY2 模板")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def install(self, nodes):
+        for node in nodes:
+            paths = node.paths()
+            write_file(paths["config"], node.config.encode("utf-8"))
+            write_file(paths["meta"], env_encode(node.meta))
+            write_file(paths["url"], (node.url + "\n").encode())
+            if node.main:
+                write_file(MAIN_FILES.get("password", f"{STATE}/main/main.password"),
+                           (node.meta["MAIN_PASSWORD"] + "\n").encode())
+                write_file(MAIN_SUB, base64.b64encode(node.url.encode()))
+            else:
+                write_file(paths["unit"], unit_text(node).encode(), 0o644)
+            for name, path in policy_paths(node.port).items():
+                value = getattr(node, name)
+                if value is not None:
+                    write_file(path, env_encode(value))
+            self.native("""port="$1"
+if [[ -f "$HY2_QUOTA_STATE_DIR/$port.env" ]]; then
+    hy2_pq_restore_one "$HY2_QUOTA_STATE_DIR/$port.env"
+    hy2_pq_reset_due_one "$HY2_QUOTA_STATE_DIR/$port.env"
+fi
+if [[ "$2" == temp ]]; then hy2_il_apply_family_guard "$port" "$3"; fi
+if [[ -f "$HY2_IPLIMIT_STATE_DIR/$port.env" ]]; then
+    hy2_il_restore_one "$HY2_IPLIMIT_STATE_DIR/$port.env"
+fi""", node.port, "main" if node.main else "temp", node.family)
+            self.policy_state(node)
+
+    def refresh_subscription(self):
+        self.run(f"{SBIN}/hy2_temp_sub.sh", env={"HY2_TEMP_LOCK_HELD": "1"})
+
+    def daily_module(self, program):
+        module = super().daily_module(program)
+        module.COMMON = Path(LIB) / "common.sh"
+        module.LOCKS = Path(LOCK_DIR)
+        return module
+
+
+Host = Hy2Host
+
+
+GUARD_PROGRAM = "/usr/local/sbin/hy2-guard"
+GUARD_STATE = "/var/lib/hy2/manual-guard/state.json"
+GUARD_TABLE = "hy2_manual_guard"
+GUARD_SHA = "134131cabeae43901309629478964d315bedcc6055c33e320de6ccfe0b4c8e73"
+
+
+def daily_key(node):
+    credential = node.meta["MAIN_PASSWORD" if node.main else "PASSWORD"]
+    created = "main" if node.main else node.meta["CREATE_EPOCH"]
+    return sha(f"{node.tag}|{node.port}|{credential}|{created}".encode())[:32]
+
+
+def ban_entry(port, network):
+    require(type(port) is int and 1 <= port <= 65535 and isinstance(network, str), "黑名单条目无效")
+    net = ipaddress.ip_network(network, strict=True)
+    require(str(net) == network, "黑名单网段必须规范")
+    return port, network
+
+
+def blacklist_files():
+    return {Path(GUARD_STATE)}
+
+
+def guard_state(raw):
+    value = decode_json(raw)
+    require(isinstance(value, dict) and set(value) == {"schema", "paused", "bans"}
+            and value["schema"] == 1 and isinstance(value["paused"], list)
+            and isinstance(value["bans"], dict), "HY2 手工防火墙状态异常")
+    require(all(type(p) is int and 1 <= p <= 65535 for p in value["paused"]), "暂停列表异常")
+    entries = set()
+    for port, nets in value["bans"].items():
+        require(isinstance(port, str) and port.isdecimal() and str(int(port)) == port
+                and isinstance(nets, list), "黑名单结构异常")
+        entries.update(ban_entry(int(port), net) for net in nets)
+    require(len(entries) <= MAX_BANS, "黑名单过多")
+    return value, entries
+
+
+def ban_plan_state(plan, ports):
+    require(isinstance(plan, dict) and set(plan) == {"previous", "entries"}
+            and isinstance(plan["previous"], str), "黑名单恢复记录异常")
+    previous = base64.b64decode(plan["previous"], validate=True)
+    _, before = guard_state(previous)
+    additions = ban_entries(plan["entries"], ports)
+    return previous, before, additions
+
+
+def merged_guard(previous, additions):
+    state, entries = guard_state(previous)
+    entries |= additions
+    state["bans"] = {str(p): sorted(net for port, net in entries if port == p)
+                     for p in sorted({port for port, _ in entries})}
+    return encode_json(state)
+
+
+class GuardHost(Host):
+    def source_daily(self, nodes):
+        # Export never collects or rewrites production counters/history.
+        # The native minute timer owns sampling; transfer its latest saved sample.
+        if not exists(TRAFFIC_PROGRAM):
+            require(not exists(daily_path()), "源机缺少每日统计程序")
+            return None
+        module = self.daily_module(secure_read(TRAFFIC_PROGRAM))
+        require(exists(daily_path()), "源机每日统计尚未采样，请等待原生定时器")
+        secure_read(daily_path(), MAX_PACKET)
+        state = module.load_state(daily_path())
+        records = {n.tag: portable_daily(state["users"][n.tag]) for n in nodes if n.tag in state["users"]}
+        result = {"program_sha256": TRAFFIC_SHA256, "users": records}
+        validate_daily_payload(result, nodes)
+        return result
+
+    def blacklist_lock(self):
+        return self.lock("/run/lock/hy2-manual-guard.lock")
+
+    def guard_verify(self):
+        if not exists(GUARD_STATE):
+            require(GUARD_TABLE not in self.tables(), "有防火墙规则但缺少持久状态")
+            return None
+        previous = secure_read(GUARD_STATE)
+        state, entries = guard_state(previous)
+        require(sha(secure_read(GUARD_PROGRAM)) == GUARD_SHA, "请先对齐 hy2-guard 版本")
+        require(self.active("hy2-manual-guard.service") and self.enabled("hy2-manual-guard.service"),
+                "hy2-manual-guard 服务未就绪")
+        raw = decode_json(self.run("nft", "-j", "list", "table", "inet", GUARD_TABLE).stdout)
+        expected = {f"hy2-guard-pause:{p}" for p in state["paused"]}
+        expected |= {f"hy2-guard-ban:{p}:{net}" for p, net in entries}
+        actual = [item["rule"].get("comment") for item in raw["nftables"] if "rule" in item]
+        require(len(actual) == len(expected) and set(actual) == expected,
+                "HY2 手工防火墙规则与状态不一致")
+        return previous
+
+    def source_blacklist(self, ports):
+        with self.blacklist_lock():
+            previous = self.guard_verify()
+            return set() if previous is None else {x for x in guard_state(previous)[1] if x[0] in ports}
+
+    def prepare_blacklist(self, requested):
+        previous = self.guard_verify()
+        require(previous is not None, "源含黑名单：请先在目标安装并启用同版本 hy2-guard")
+        require(len(guard_state(previous)[1] | requested) <= MAX_BANS, "合并后黑名单超过上限")
+        additions = requested - guard_state(previous)[1]
+        if not additions:
+            return None
+        require(not exists(pending_file(Path(GUARD_STATE))), "手工防火墙有未完成写入")
+        return {"previous": base64.b64encode(previous).decode(), "entries": [list(x) for x in sorted(additions)]}
+
+    def apply_blacklist(self, plan, ports):
+        previous, _, additions = ban_plan_state(plan, ports)
+        require(secure_read(GUARD_STATE) == previous, "防火墙状态并发改变")
+        write_file(GUARD_STATE, merged_guard(previous, additions))
+        # Parent holds the native guard lock; use the pinned renderer without acquiring it again.
+        self.guard_apply()
+
+    def guard_apply(self):
+        program = secure_read(GUARD_PROGRAM)
+        require(sha(program) == GUARD_SHA, "hy2-guard 版本改变")
+        module = ModuleType("hy2qianyi_guard")
+        exec(compile(program, GUARD_PROGRAM, "exec"), module.__dict__)
+        module.apply(module.load())
+
+    def verify_blacklist(self, plan, ports):
+        previous, before, additions = ban_plan_state(plan, ports)
+        current = self.guard_verify()
+        require(current is not None and guard_state(current)[1] == before | additions,
+                "迁入黑名单验证失败")
+
+    def restore_blacklist(self, plan, ports):
+        previous, _, additions = ban_plan_state(plan, ports)
+        require(secure_read(GUARD_STATE) in (previous, merged_guard(previous, additions)),
+                "防火墙被外部改动，保留恢复文件")
+        write_file(GUARD_STATE, previous)
+        self.guard_apply()
+        require(self.guard_verify() == previous, "防火墙恢复失败")
+
+
+Host = GuardHost
+
+
+@contextlib.contextmanager
+def preserve_stops(host, ports):
+    # Keep native expiry cleanup from waiting for this transaction's temp.lock.
+    # Markers are root-only and valid only while this initiating PID lives.
+    markers = []
+    try:
+        for node in host.inventory().values():
+            if node.main or node.port not in ports:
+                continue
+            path = Path(LOCK_DIR) / f"stoppost-preserve.{node.tag}"
+            if exists(path):
+                value = secure_read(path).decode().strip()
+                require(value.isdecimal(), "停止保护标记无效")
+                try:
+                    os.kill(int(value), 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise MigrationError("临时节点已被其他进程保护")
+            write_file(path, f"{os.getpid()}\n".encode())
+            markers.append((path, node.unit))
+        deadline = time.monotonic() + 30
+        while any(host.property(unit, "ControlPID") not in ("", "0")
+                  or host.property(unit, "ActiveState") == "deactivating" for _, unit in markers):
+            require(time.monotonic() < deadline, "旧节点正在清理，尚未替换配置，请稍后重试")
+            time.sleep(.2)
+        yield
+    finally:
+        for path, _ in markers:
+            remove_file(path)
+
+
+def source_bundle(host):
+    with host.temp_lock(), host.policy_lock():
+        require(not exists(JOURNAL) and not exists(pending_file(Path(JOURNAL))),
+                "本机还有未完成的接管，请先运行 recover")
+        current = host.inventory()
+        now = int(time.time())
+        nodes = [host.read_node(entry) for entry in current.values()
+                 if entry.main or entry.expiry > now]
+        by_port = {node.port: node for node in nodes}
+        host.check_optional_policies(set(by_port))
+        listeners = host.inspect_owners(set(by_port), by_port)
+        for node in nodes:
+            host.check_unit(node)
+            require(node.port in listeners and host.active(node.unit) and host.enabled(node.unit),
+                    f"源端口 {node.port} 未处于正常运行并启用状态，请先处理")
+            host.policy_state(node)
+            host.capture_quota(node)
+        profile = host.profile(any(node.nat for node in nodes))
+        blacklist = host.source_blacklist(set(by_port))
+        daily = host.source_daily(nodes)
+        require(len(blacklist) <= MAX_BANS, "待迁黑名单条目超过大小限制")
+        packet = encode_json({"format": FORMAT, "origin": host.identity(), "profile": profile,
+                              "nodes": [asdict(node) for node in nodes], "blacklist": sorted(blacklist), "daily": daily})
+        require(len(packet) <= MAX_PACKET and len(nodes) <= 512, "节点数量或迁移包超过限制")
+        return packet
+
+
+def expired(node, now=None):
+    return not node.main and node.expiry <= (int(time.time()) if now is None else now)
+
+
+def journal_write(tx):
+    packet = encode_json(tx)
+    require(len(packet) <= MAX_PACKET * 2, "恢复文件超过大小限制")
+    write_file(JOURNAL, packet)
+
+
+def journal_read():
+    data = decode_json(secure_read(JOURNAL, MAX_PACKET * 2))
+    fields = {"format", "fence", "phase", "new", "old", "defaults", "main_subscription"}
+    require(isinstance(data, dict) and set(data) - {"blacklist", "daily"} == fields
+            and data["format"] == FORMAT and isinstance(data["fence"], str) and FENCE.fullmatch(data["fence"])
+            and data["phase"] in {"prepare", "restore", "rollback_done", "publish"}
+            and isinstance(data["old"], list) and isinstance(data["new"], list), "恢复文件格式不支持")
+    new, old = transaction_nodes(data)
+    unique_nodes(new)
+    unique_nodes([node for _, node in old])
+    require(any(n.main for n in new) and any(n.main for _, n in old), "恢复文件缺少 443")
+    require({node.port for _, node in old} <= {node.port for node in new}, "恢复文件端口不匹配")
+    for record, node in old:
+        require(type(record.get("active")) is bool and type(record.get("enabled")) is bool
+                and isinstance(record.get("slots"), list), f"端口 {node.port} 恢复状态无效")
+    for key in ("defaults", "main_subscription"):
+        require(isinstance(data[key], str) and len(data[key]) <= MAX_STATE_FILE * 2,
+                "主节点恢复材料异常")
+        base64.b64decode(data[key], validate=True)
+    if "blacklist" in data:
+        ban_plan_state(data["blacklist"], {node.port for node in new})
+    if "daily" in data:
+        validate_daily_plan(data["daily"], new, [node for _, node in old])
+    return data
+
+
+def transaction_nodes(tx):
+    return [parse_node(item) for item in tx["new"]], [(item, parse_node(item["node"])) for item in tx["old"]]
+
+
+def transaction_files(nodes):
+    paths = {Path(MAIN_SUB), Path(MAIN_DEFAULTS), Path(JOURNAL)}
+    for node in nodes:
+        paths.update(map(Path, node.paths().values()))
+        paths.update(map(Path, policy_paths(node.port).values()))
+        paths.add(guard_file(node.unit))
+    return paths
+
+
+def clean_pending(nodes, table, *, blacklist=False, daily=None):
+    paths = transaction_files(nodes) | {permit_file(table)}
+    if blacklist:
+        paths.update(blacklist_files())
+    if daily is not None:
+        paths.update(daily_files() if daily["install"] else {daily_path()})
+        paths.update(guard_file(unit) for unit in daily_guard_units(daily))
+    for path in paths:
+        temporary = pending_file(path)
+        if exists(temporary):
+            secure_read(temporary, MAX_PACKET * 2)
+            remove_file(temporary)
+
+
+@contextlib.contextmanager
+def defer_interrupts():
+    signals = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    old = {sig: signal.signal(sig, signal.SIG_IGN) for sig in signals}
+    try:
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
+def stop_defined(host, units):
+    defined = [u for u in sorted(units) if host.property(u, "LoadState") != "not-found"]
+    markers = []
+    try:
+        for unit in defined:
+            require(host.property(unit, "FragmentPath") == f"{SYSTEMD}/{unit}",
+                    f"服务归属异常，未停止 {unit}")
+            if TAG.fullmatch(unit.removesuffix(".service")):
+                path = Path(LOCK_DIR) / f"stoppost-preserve.{unit.removesuffix('.service')}"
+                if exists(path):
+                    value = secure_read(path).decode().strip()
+                    require(value.isdecimal(), "停止保护标记无效")
+                    try:
+                        os.kill(int(value), 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        require(int(value) == os.getpid(), "另一个进程正在保护临时节点停止")
+                        continue
+                write_file(path, f"{os.getpid()}\n".encode())
+                markers.append(path)
+        if defined:
+            host.sys("stop", *defined, timeout=100)
+    finally:
+        for path in markers:
+            remove_file(path)
+
+
+def restore_target(host, tx, *, recovering=False):
+    new, backup = transaction_nodes(tx)
+    old = [node for _, node in backup]
+    ports = {node.port for node in new}
+    units = {node.unit for node in new + old}
+    blacklist = tx.get("blacklist")
+    daily = tx.get("daily")
+    guarded = units | daily_guard_units(daily)
+    clean_pending(new + old, tx["fence"], blacklist=blacklist is not None, daily=daily)
+    if tx["phase"] == "restore":
+        if tx["fence"] not in host.tables():
+            host.fence(tx["fence"], ports)
+        host.guard_units(tx["fence"], guarded)
+        stop_defined(host, units)
+        require(not host.listeners(ports), "恢复时端口已被外部服务占用")
+        for node in new:
+            if not node.main and host.property(node.unit, "LoadState") != "not-found":
+                host.sys("disable", node.unit)
+        if blacklist is not None:
+            host.restore_blacklist(blacklist, ports)
+        with host.policy_lock():
+            host.clear_policies(ports)
+            host.remove_temp_nodes(new + old)
+            write_file(MAIN_DEFAULTS, base64.b64decode(tx["defaults"], validate=True))
+            host.install(old)
+            write_file(MAIN_SUB, base64.b64decode(tx["main_subscription"], validate=True))
+            for record, node in backup:
+                host.restore_ip_slots(node, record["slots"])
+        if daily is not None:
+            host.restore_daily(daily)
+        host.sys("daemon-reload")
+        for record, node in backup:
+            host.sys("enable" if record["enabled"] else "disable", node.unit)
+        active = [node for record, node in backup if record["active"] and not expired(node)]
+        if active:
+            host.permit_units(tx["fence"])
+            host.sys("start", *(node.unit for node in active), timeout=150)
+        host.wait_ready(active)
+        host.refresh_subscription()
+        tx["phase"] = "rollback_done"
+        journal_write(tx)
+    elif recovering:
+        active = [node for record, node in backup if record["active"] and not expired(node)]
+        if active:
+            host.permit_units(tx["fence"])
+            host.sys("start", *(node.unit for node in active), timeout=150)
+        host.wait_ready(active)
+        host.refresh_subscription()
+    host.clear_guards(tx["fence"], guarded)
+    host.unfence(tx["fence"])
+    remove_file(JOURNAL)
+
+
+def publish_target(host, tx, *, recovering=False):
+    nodes, old = transaction_nodes(tx)
+    daily = tx.get("daily")
+    if recovering:
+        blacklist = tx.get("blacklist")
+        clean_pending(nodes + [node for _, node in old], tx["fence"], blacklist=blacklist is not None, daily=daily)
+        if blacklist is not None:
+            host.verify_blacklist(blacklist, {node.port for node in nodes})
+        live = [node for node in nodes if not expired(node)]
+        host.permit_units(tx["fence"])
+        host.sys("start", *(node.unit for node in live), timeout=150)
+        host.wait_ready(live)
+        with host.policy_lock():
+            for node in live:
+                host.policy_state(node)
+        host.refresh_subscription()
+        host.legacy(remove=True)
+    guarded = {node.unit for node in nodes} | {node.unit for _, node in old} | daily_guard_units(daily)
+    host.clear_guards(tx["fence"], guarded)
+    if daily is not None:
+        host.finish_daily(daily)
+    host.unfence(tx["fence"])
+    remove_file(JOURNAL)
+
+
+def apply_bundle(host, packet):
+    origin, profile, all_incoming, all_bans, daily = decode_bundle(packet)
+    with host.temp_lock(), preserve_stops(host, {n.port for n in all_incoming}), (host.blacklist_lock() if all_bans else contextlib.nullcontext()):
+        require(not exists(JOURNAL) and not exists(pending_file(Path(JOURNAL))),
+                "目标机还有未完成的接管，请先运行 recover")
+        require(origin != host.identity(), "源机和目标机 machine-id 相同，请核对两台机器")
+        require(profile == host.profile(any(node.nat for node in all_incoming)),
+                "两端 hy2jieshu 运行库版本不一致，请先对齐")
+        now = int(time.time())
+        incoming = [node for node in all_incoming if not expired(node, now)]
+        if len(incoming) != len(all_incoming):
+            print("已跳过传输期间到期的临时节点。", flush=True)
+        host.legacy()
+        current = host.inventory()
+        require(current[443].meta.get("HY_DOMAIN") == next(n.meta["HY_DOMAIN"] for n in incoming if n.main),
+                "目标主节点必须预先部署同一 HY_DOMAIN 的证书及续期配置")
+        nodes, conflicts = plan_nodes(incoming, current)
+        ports = {node.port for node in nodes}
+        requested_bans = {entry for entry in all_bans if entry[0] in ports}
+        daily_plan = host.prepare_daily(daily, incoming, nodes) if daily is not None else None
+        for node in nodes:
+            if node.main:
+                for local_key in ("ACME_EMAIL", "ACME_SH_VERSION", "HYSTERIA_VERSION", "HYSTERIA_UPDATE_POLICY", "INSTALL_EPOCH", "MANAGER_VERSION"):
+                    if local_key in current[443].meta:
+                        node.meta[local_key] = current[443].meta[local_key]
+                node.meta["HY_IPV6_DOMAIN"] = current[443].meta.get("HY_IPV6_DOMAIN", "")
+                version = current[443].meta.get("HYSTERIA_RUNTIME_VERSION")
+                if version is None:
+                    node.meta.pop("HYSTERIA_RUNTIME_VERSION", None)
+                else:
+                    node.meta["HYSTERIA_RUNTIME_VERSION"] = version
+            host.adapt_nat(node)
+            validate_node(node)
+            host.test_config(node)
+
+        with host.policy_lock():
+            host.check_optional_policies(ports)
+            old = [host.read_node(entry) for entry in conflicts.values()]
+            old_by_port = {node.port: node for node in old}
+            old_by_unit = {node.unit: node for node in old}
+            host.inspect_owners(ports, old_by_port)
+            blacklist = host.prepare_blacklist(requested_bans) if requested_bans else None
+            paths = {path for node in old for path in node.paths().values()}
+            for node in old:
+                host.check_unit(node)
+            for node in nodes:
+                for path in node.paths().values():
+                    require(path in paths or not exists(path), f"目标上有未归属的文件 {path}")
+                if node.unit not in old_by_unit:
+                    require(host.property(node.unit, "LoadState") == "not-found",
+                            f"目标上有非本轮管理的服务 {node.unit}")
+                if node.port not in old_by_port:
+                    require(not any(exists(path) for path in policy_paths(node.port).values()),
+                            f"端口 {node.port} 已有无法归属的策略文件")
+            for path in transaction_files(nodes + old):
+                is_guard = path.name == "80-hy2qianyi-transaction.conf"
+                require((not exists(path.parent) if is_guard else path.parent.is_dir())
+                        and path.resolve() == path and not exists(pending_file(path)),
+                        f"目标路径异常或有未归属的临时文件 {path}")
+            for unit in daily_guard_units(daily_plan):
+                require(not exists(guard_file(unit).parent), f"目标统计服务已有未知保护 {unit}")
+            old_subscription = secure_read(MAIN_SUB)
+            old_defaults = secure_read(MAIN_DEFAULTS)
+            new_defaults = main_defaults(old_defaults, next(node.meta for node in nodes if node.main))
+            backup = [dict(node=asdict(node), active=host.active(node.unit),
+                           enabled=host.enabled(node.unit), slots=[]) for node in old]
+
+        tx = dict(format=FORMAT, fence=f"hy2qianyi_{secrets.token_hex(8)}", phase="prepare",
+                  new=[asdict(node) for node in nodes], old=backup,
+                  defaults=base64.b64encode(old_defaults).decode(),
+                  main_subscription=base64.b64encode(old_subscription).decode())
+        if blacklist is not None:
+            tx["blacklist"] = blacklist
+        if daily_plan is not None:
+            tx["daily"] = daily_plan
+        journal_write(tx)
+        try:
+            host.fence(tx["fence"], ports)
+            host.guard_units(tx["fence"], {node.unit for node in nodes + old} | daily_guard_units(daily_plan))
+            with host.policy_lock():
+                # The scoped fence prevents an old target quota moving after this snapshot.
+                for record, entry in zip(backup, old, strict=True):
+                    node = host.read_node(entry)
+                    host.capture_quota(node)
+                    record["slots"] = host.capture_ip_slots(node)
+                    record["node"] = asdict(node)
+                if daily_plan is not None:
+                    host.capture_daily_before(daily_plan, old)
+                tx["phase"] = "restore"
+                journal_write(tx)
+
+            require(not any(expired(node) for node in nodes), "预检期间有迁入节点到期，请重新导出")
+            stop_defined(host, set(old_by_unit))
+            require(not host.listeners(ports), "目标端口未停止或被其他服务抢占")
+            incoming_units = {node.unit for node in nodes}
+            for node in old:
+                if node.unit not in incoming_units:
+                    host.sys("disable", node.unit)
+            with host.policy_lock():
+                host.clear_policies(ports)
+                host.remove_temp_nodes(old)
+                write_file(MAIN_DEFAULTS, new_defaults)
+                host.install(nodes)
+            if blacklist is not None:
+                host.apply_blacklist(blacklist, ports)
+                host.verify_blacklist(blacklist, ports)
+            if daily_plan is not None:
+                host.apply_daily(daily_plan)
+            host.sys("daemon-reload")
+            host.sys("enable", *(node.unit for node in nodes), timeout=100)
+            host.permit_units(tx["fence"])
+            host.sys("start", *(node.unit for node in nodes), timeout=150)
+            host.wait_ready(nodes)
+            host.refresh_subscription()
+            with host.policy_lock():
+                for node in nodes:
+                    host.policy_state(node)
+            host.legacy(remove=True)
+
+            # Once publication is durable, never restore old quota after opening traffic.
+            tx["phase"] = "publish"
+            journal_write(tx)
+            publish_target(host, tx)
+        except BaseException:
+            with defer_interrupts():
+                try:
+                    durable = journal_read() if exists(JOURNAL) else None
+                    if durable is not None and durable["phase"] == "publish":
+                        raise MigrationError("目标配置已提交，清理未确认，请运行 recover 完成收尾")
+                    if durable is not None:
+                        restore_target(host, durable)
+                        print("已恢复目标机原节点状态，源机仍在运行。", file=sys.stderr, flush=True)
+                except Exception as recovery:
+                    raise MigrationError(f"目标未完成收尾，保留恢复文件 {JOURNAL}。{recovery}") from None
+            raise
+        print(f"目标已接管 443，替换 {len(old) - 1} 个临时节点，新增 {len(nodes) - len(old)} 个临时节点。", flush=True)
+        if requested_bans:
+            print(f"已接续 {len(requested_bans)} 条源机黑名单。", flush=True)
+        if daily_plan is not None:
+            print(f"已接续 {len(daily_plan['incoming'])} 个节点的每日流量历史（最近 30 天）。", flush=True)
+
+
+def recover_target(host):
+    with host.temp_lock(), defer_interrupts():
+        if not exists(JOURNAL):
+            pending = pending_file(Path(JOURNAL))
+            if exists(pending):
+                secure_read(pending, MAX_PACKET * 2)
+                remove_file(pending)
+            host.legacy(remove=True)
+            return
+        tx = journal_read()
+        with host.blacklist_lock() if "blacklist" in tx else contextlib.nullcontext():
+            if tx["phase"] == "publish":
+                publish_target(host, tx, recovering=True)
+            else:
+                restore_target(host, tx, recovering=True)
+                host.legacy(remove=True)
+
+
+class Workspace:
+    def __init__(self, path):
+        self.path = path
+
+    @classmethod
+    def for_cli(cls):
+        path = Path(__file__).absolute()
+        directory = path.parent
+        require(path.name == "hy2qianyi.py" and directory.parent == Path("/run")
+                and re.fullmatch(r"hy2qianyi\.[A-Za-z0-9]{8}", directory.name)
+                and path.resolve() == path, "请使用 README 的临时运行命令")
+        info = directory.stat()
+        require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o700, "迁移目录权限必须为 root 0700")
+        return cls(directory)
+
+    def cleanup(self):
+        if self.path.exists():
+            shutil.rmtree(self.path)
+        require(not exists(self.path), f"临时工作目录未清理 {self.path}")
+
+
+# The helper is read completely by Python before its private directory is removed.
+# The outer shell covers a failed download or interpreter startup.
+BOOTSTRAP = r"""set -eu
+umask 077
+u="$1"; h="$2"; shift 2
+d="$(mktemp -d /run/hy2qianyi.XXXXXXXX)"
+trap 'rm -rf -- "$d"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+curl --proto '=https' -fsSL --max-time 90 "$u" -o "$d/hy2qianyi.py"
+printf '%s  %s\n' "$h" "$d/hy2qianyi.py" | sha256sum -c - >/dev/null
+python3 -I -B "$d/hy2qianyi.py" "$@"
+"""
+
+
+def bootstrap_command(digest, args):
+    return shlex.join(["bash", "-c", BOOTSTRAP.replace("\n", "; ").strip("; "), "hy2qianyi",
+                       SOURCE_URL, digest, *args])
+
+
+def ssl_server(host, work):
+    key = work / "key.pem"
+    cert = work / "cert.pem"
+    host.run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+             "-days", "1", "-subj", "/CN=hy2qianyi-session", "-keyout", key, "-out", cert)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    digest = sha(ssl.PEM_cert_to_DER_cert(cert.read_text()))
+    return context, digest
+
+
+def check_request(conn, token, deadline):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        if len(data) >= 4096 or time.monotonic() >= deadline:
+            return False
+        conn.settimeout(max(0.001, deadline - time.monotonic()))
+        part = conn.recv(4096 - len(data))
+        if not part:
+            return False
+        data += part
+    headers, body = data.split(b"\r\n\r\n", 1)
+    request, *lines = headers.split(b"\r\n")
+    expected = b"Bearer " + token.encode("ascii")
+    auth = [line.partition(b":")[2].strip() for line in lines if line.partition(b":")[0].lower() == b"authorization"]
+    return request == b"POST /bundle HTTP/1.1" and not body and len(auth) == 1 and secrets.compare_digest(auth[0], expected)
+
+
+def serve_packet(bind, port, context, packet, token, ttl, ready, cleanup):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((bind, port))
+        listener.listen(8)
+        deadline = time.monotonic() + ttl
+        ready(listener.getsockname()[1])
+        while time.monotonic() < deadline:
+            listener.settimeout(max(0.001, deadline - time.monotonic()))
+            try:
+                raw, _ = listener.accept()
+            except TimeoutError:
+                break
+            with raw:
+                request_deadline = min(deadline, time.monotonic() + 5)
+                try:
+                    raw.settimeout(max(0.001, request_deadline - time.monotonic()))
+                    conn = context.wrap_socket(raw, server_side=True)
+                except OSError:
+                    continue
+                with conn:
+                    try:
+                        authorized = check_request(conn, token, request_deadline)
+                    except OSError:
+                        continue
+                    if not authorized:
+                        continue
+                    listener.close()
+                    # A valid response attests that the sender has already removed its files.
+                    # The bundle and TLS state are now in memory only.
+                    cleanup()
+                    conn.settimeout(45)
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                                 + f"Content-Length: {len(packet)}\r\n".encode()
+                                 + b"Cache-Control: no-store\r\nConnection: close\r\n\r\n")
+                    conn.sendall(packet)
+                    return
+    raise MigrationError("传输会话已到期，请从源机重新执行")
+
+
+def fetch_packet(raw, pin, token, digest):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    raw.settimeout(45)
+    with context.wrap_socket(raw, server_hostname=None) as conn:
+        require(secrets.compare_digest(sha(conn.getpeercert(binary_form=True)), pin),
+                "源 TLS 证书指纹不符，未发送令牌")
+        conn.sendall(b"POST /bundle HTTP/1.1\r\nHost: hy2qianyi-source\r\nAuthorization: Bearer "
+                     + token.encode("ascii") + b"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+        with http.client.HTTPResponse(conn) as response:
+            response.begin()
+            require(response.status == 200 and not response.chunked, "源传输响应异常")
+            size = number(response.getheader("Content-Length"), "迁移包长度", 1, MAX_PACKET)
+            packet = response.read(size)
+        require(len(packet) == size and secrets.compare_digest(sha(packet), digest),
+                "迁移包长度或 SHA-256 不符")
+        return packet
+
+
+def ssh_host_key(value):
+    require(isinstance(value, str) and len(value) <= 256, "SSH 主机公钥格式无效")
+    try:
+        blob = base64.b64decode(value, validate=True)
+    except ValueError:
+        raise MigrationError("SSH 主机公钥格式无效") from None
+    require(len(blob) == 51 and blob.startswith(b"\0\0\0\x0bssh-ed25519\0\0\0 "), "SSH 主机公钥格式无效")
+    return value
+
+
+@contextlib.contextmanager
+def connect_source(args, work):
+    if args.ssh_key is None:
+        with socket.create_connection((args.host, args.port), timeout=20) as raw:
+            yield raw
+        return
+    pin = work / "known_hosts"
+    forward = work / "source.sock"
+    write_file(pin, f"hy2qianyi-source ssh-ed25519 {ssh_host_key(args.ssh_key)}\n".encode())
+    ssh = subprocess.Popen([
+        "ssh", "-F", "/dev/null", "-N", "-T", "-p", str(args.ssh_port),
+        "-o", "HostKeyAlias=hy2qianyi-source", "-o", f"UserKnownHostsFile={pin}",
+        "-o", "GlobalKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=yes",
+        "-o", "UpdateHostKeys=no", "-o", "HostKeyAlgorithms=ssh-ed25519",
+        "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindMask=0177",
+        "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+        "-L", f"{forward}:127.0.0.1:{args.port}", f"root@{args.host}",
+    ])
+    try:
+        deadline = time.monotonic() + 90
+        while not forward.exists():
+            require(ssh.poll() is None and time.monotonic() < deadline,
+                    "SSH 隧道未就绪，检查 root SSH、主机公钥和 AllowTcpForwarding")
+            time.sleep(0.1)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            raw.settimeout(20)
+            raw.connect(str(forward))
+            yield raw
+    finally:
+        with defer_interrupts():
+            if ssh.poll() is None:
+                ssh.terminate()
+                try:
+                    ssh.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    ssh.kill()
+                    ssh.wait()
+            forward.unlink(missing_ok=True)
+            pin.unlink(missing_ok=True)
+
+
+def send(args, host, workspace):
+    address, ssh_port, transfer_port = source_endpoint(args)
+    host.legacy()
+    packet = source_bundle(host)
+    context, pin = ssl_server(host, workspace.path)
+    token = secrets.token_urlsafe(32)
+    fingerprint = sha(secure_read(Path(__file__).absolute()))
+    ssh_options = []
+    if not args.direct:
+        key = secure_read("/etc/ssh/ssh_host_ed25519_key.pub").decode().split()
+        require(len(key) >= 2 and key[0] == "ssh-ed25519", "未找到有效的源机 Ed25519 SSH 主机公钥")
+        ssh_options = ["--ssh-key", ssh_host_key(key[1]), "--ssh-port", str(ssh_port)]
+
+    def ready(port):
+        command = bootstrap_command(fingerprint, ["receive", "--host", address, "--port", str(port),
+                                                  "--pin", pin, "--sha256", sha(packet), *ssh_options])
+        print("保持源端终端开启。请在目标机的 root 终端运行这一行：", flush=True)
+        print(command, flush=True)
+        print(f"目标机提示输入令牌时粘贴这一串：{token}", flush=True)
+
+    def cleanup():
+        host.legacy(remove=True)
+        workspace.cleanup()
+
+    serve_packet("0.0.0.0" if args.direct else "127.0.0.1", transfer_port,
+                 context, packet, token, args.ttl, ready, cleanup)
+    print("源机已发送快照并清理本轮迁移工具与临时文件。", flush=True)
+
+
+def receive(args, host):
+    require(HEX.fullmatch(args.pin) and HEX.fullmatch(args.sha256), "证书或迁移包 SHA-256 格式无效")
+    require(sys.stdin.isatty(), "请从目标机交互式 root 终端运行")
+    token = getpass.getpass("一次性迁移令牌（输入不回显）：")
+    require(re.fullmatch(r"[A-Za-z0-9_-]{43}", token), "一次性迁移令牌格式无效")
+    with connect_source(args, host.work) as raw:
+        packet = fetch_packet(raw, args.pin, token, args.sha256)
+    apply_bundle(host, packet)
+
+
+def write_ssh_frame(stream, packet):
+    require(0 < len(packet) <= MAX_PACKET, "迁移快照大小无效")
+    stream.write(f"HY2SSH1 {len(packet)} {sha(packet)}\n".encode("ascii"))
+    stream.write(packet)
+    stream.flush()
+
+
+def read_ssh_frame(stream):
+    remaining = MAX_SSH_PREAMBLE
+    while remaining:
+        # Some login shells print a banner before executing the SSH command.
+        line = stream.readline(remaining)
+        if not line:
+            break
+        header = SSH_FRAME.fullmatch(line.removeprefix(b"\xef\xbb\xbf"))
+        if header is not None:
+            size = number(header[1].decode("ascii"), "迁移快照长度", 1, MAX_PACKET)
+            packet = stream.read(size)
+            require(len(packet) == size and secrets.compare_digest(sha(packet).encode("ascii"), header[2]),
+                    "SSH 迁移快照不完整或 SHA-256 不符")
+            require(not stream.read(1), "SSH 迁移快照之后有额外数据")
+            return packet
+        remaining -= len(line)
+    raise MigrationError("SSH 未收到有效的迁移快照")
+
+
+def export_ssh(host, workspace):
+    require(not sys.stdout.isatty(), "请从 Windows PowerShell 启动自动迁移")
+    host.legacy()
+    packet = source_bundle(host)
+    host.legacy(remove=True)
+    workspace.cleanup()
+    write_ssh_frame(sys.stdout.buffer, packet)
+
+
+def import_ssh(host):
+    require(not sys.stdin.isatty(), "请从 Windows PowerShell 启动自动迁移")
+    apply_bundle(host, read_ssh_frame(sys.stdin.buffer))
+
+
+def port_arg(value):
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("端口必须在 1 到 65535 之间")
+    return port
+
+
+def ipv4(value):
+    return str(ipaddress.IPv4Address(value))
+
+
+def ssh_endpoint(connection):
+    fields = connection.split()
+    if len(fields) != 4:
+        return None, None
+    try:
+        address = ipaddress.ip_address(fields[2])
+    except ValueError:
+        address = None
+    if isinstance(address, ipaddress.IPv6Address):
+        address = address.ipv4_mapped
+    if address and (not address.is_global or address.is_multicast):
+        address = None
+    try:
+        port = port_arg(fields[3])
+    except (ValueError, argparse.ArgumentTypeError):
+        port = None
+    return str(address) if address else None, port
+
+
+def prompt_setting(label, default, parse):
+    suffix = f"（回车使用 {default}）" if default is not None else ""
+    while True:
+        try:
+            value = input(f"{label}{suffix} > ").strip()
+        except EOFError:
+            raise MigrationError(f"没有收到{label}，请在源机终端重新运行") from None
+        if not value and default is not None:
+            return default
+        try:
+            return parse(value)
+        except (ValueError, argparse.ArgumentTypeError):
+            print(f"{label}格式不正确，请重新输入。", file=sys.stderr)
+
+
+def source_endpoint(args):
+    detected_host, detected_port = ssh_endpoint(os.environ.get("SSH_CONNECTION", ""))
+    address = args.host or detected_host
+    ssh_port = args.ssh_port or detected_port or 22
+    if args.host is None and sys.stdin.isatty():
+        address = prompt_setting("目标机能连接的源机管理 IPv4", address, ipv4)
+        if not args.direct and args.ssh_port is None:
+            ssh_port = prompt_setting("源机对外的 SSH 端口", ssh_port, port_arg)
+    require(address, "未识别到源机管理 IPv4，请在源机终端运行并按提示填写")
+    # A loopback listener can use port zero. Direct mode needs a known
+    # externally reachable port, so keep its existing default.
+    transfer_port = args.port if args.port is not None else (48999 if args.direct else 0)
+    return address, ssh_port, transfer_port
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="hy2jieshu 双 VPS 一次性轮换")
+    sub = parser.add_subparsers(dest="action", required=True)
+    source = sub.add_parser("send", help="从当前生产机导出，等待目标机接收")
+    source.add_argument("--host", type=ipv4, help="源机管理 IPv4（默认从 SSH 会话读取或交互填写）")
+    source.add_argument("--ssh-port", type=port_arg, help="源机 SSH 端口（默认读取当前登录端口）")
+    source.add_argument("--port", type=port_arg, help="传输端口（默认由系统分配，直连模式默认 48999）")
+    source.add_argument("--ttl", type=int, choices=range(60, 3601), metavar="60–3600", default=1200)
+    source.add_argument("--direct", action="store_true", help="使用已有可达的 HTTPS 端口，跳过 SSH 隧道")
+    target = sub.add_parser("receive", help="接收并按端口接管 443 和临时节点")
+    target.add_argument("--host", required=True, type=ipv4)
+    target.add_argument("--port", required=True, type=port_arg)
+    target.add_argument("--pin", required=True)
+    target.add_argument("--sha256", required=True)
+    target.add_argument("--ssh-key")
+    target.add_argument("--ssh-port", type=port_arg, default=22)
+    sub.add_parser("export-ssh", help="由 Windows 工具通过 SSH 读取快照")
+    sub.add_parser("import-ssh", help="由 Windows 工具通过 SSH 提交快照")
+    sub.add_parser("recover", help="恢复或完成上次被中断的目标机事务")
+    return parser.parse_args(argv)
+
+
+def on_interrupt(signum, _frame):
+    raise MigrationError(f"迁移收到中断信号 {signum}")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    workspace = None
+    try:
+        require(os.geteuid() == 0, "请以 root 运行")
+        require(sys.version_info >= (3, 10), "需要 Python 3.10 或更新版本")
+        workspace = Workspace.for_cli()
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, on_interrupt)
+        host = Host(workspace.path)
+        if args.action == "send":
+            send(args, host, workspace)
+        elif args.action == "receive":
+            receive(args, host)
+        elif args.action == "export-ssh":
+            export_ssh(host, workspace)
+        elif args.action == "import-ssh":
+            import_ssh(host)
+        else:
+            recover_target(host)
+        workspace.cleanup()
+    except (MigrationError, OSError, ValueError, KeyError, TypeError) as exc:
+        if workspace is not None:
+            try:
+                with defer_interrupts():
+                    workspace.cleanup()
+            except (MigrationError, OSError):
+                print(f"清理失败，检查迁移工作目录 {workspace.path}", file=sys.stderr)
+        if isinstance(exc, MigrationError):
+            message = str(exc)
+        elif isinstance(exc, OSError):
+            message = exc.strerror or type(exc).__name__
+        else:
+            message = f"配置、迁移包或系统命令输出格式异常（{type(exc).__name__}）"
+        print(f"迁移未完成。{message}", file=sys.stderr)
+        return 1
+    if args.action in ("receive", "import-ssh"):
+        print("迁移完成。两端的本轮临时文件和工具已清理，请验证原链接、切 DNS，再自行重装旧机。", flush=True)
+    elif args.action == "recover":
+        print("恢复与清理完成，请检查目标节点状态。", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

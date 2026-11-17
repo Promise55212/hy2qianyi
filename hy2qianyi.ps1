@@ -1,0 +1,180 @@
+﻿# Windows PowerShell 5.1 and later. Credentials stay in the local SSH client.
+$ErrorActionPreference = 'Stop'
+$Hy2QianyiPythonHash = '8ddf45149af35ac7ee0e5bbb0d928cbfc5428b20470da5a9ad6c0ad6af764fda'
+$Hy2QianyiFrameLimit = 32MB + 8192 + 128
+$Hy2QianyiLinuxBootstrap = @'
+set -eu
+umask 077
+d="$(mktemp -d /run/hy2qianyi.XXXXXXXX)"
+trap 'rm -rf -- "$d"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+curl --proto '=https' -fsSL --max-time 90 https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
+printf '%s  %s\n' "$1" "$d/hy2qianyi.py" | sha256sum -c - >/dev/null
+python3 -I -B "$d/hy2qianyi.py" "$2"
+'@
+
+function Read-Hy2QianyiPort([string] $Role, [int] $DefaultPort) {
+    while ($true) {
+        $inputValue = (Read-Host "$Role SSH 端口（回车使用 $DefaultPort）").Trim()
+        if (-not $inputValue) {
+            return $DefaultPort
+        }
+        if ($inputValue -match '^[0-9]{1,5}$') {
+            $port = [int] $inputValue
+            if ($port -ge 1 -and $port -le 65535) {
+                return $port
+            }
+        }
+        Write-Host 'SSH 端口请输入 1 到 65535 之间的数字。'
+    }
+}
+
+function Read-Hy2QianyiEndpoint([string] $Role, [string] $Prompt) {
+    while ($true) {
+        $inputValue = (Read-Host $Prompt).Trim()
+        if ($inputValue -match '^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$') {
+            $address = $Matches[1]
+            $port = if ($Matches.ContainsKey(2)) { [int] $Matches[2] } else { 22 }
+            $parsed = $null
+            if ([Net.IPAddress]::TryParse($address, [ref] $parsed) -and
+                $parsed.ToString() -eq $address -and $port -ge 1 -and $port -le 65535) {
+                return [pscustomobject] @{ Address = $address; Port = (Read-Hy2QianyiPort $Role $port) }
+            }
+        }
+        Write-Host '请输入正确的 IPv4 地址。'
+    }
+}
+
+function Find-Hy2QianyiKey {
+    foreach ($name in @('vps_root_ed25519', 'id_ed25519', 'id_ecdsa', 'id_rsa')) {
+        $path = Join-Path $env:USERPROFILE ".ssh\$name"
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            return $path
+        }
+    }
+    while ($true) {
+        $path = (Read-Host '请输入 Windows 上用于登录两台 VPS 的 SSH 私钥文件路径').Trim().Trim('"')
+        if ($path -and (Test-Path -LiteralPath $path -PathType Leaf) -and -not $path.EndsWith('.pub')) {
+            return (Resolve-Path -LiteralPath $path).ProviderPath
+        }
+        Write-Host '没有找到私钥文件，请检查路径。'
+    }
+}
+
+function Join-Hy2QianyiArguments([string[]] $Arguments) {
+    # ProcessStartInfo.Arguments uses the Windows native command-line quoting rules.
+    $quoted = foreach ($argument in $Arguments) {
+        '"' + ($argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+    }
+    return $quoted -join ' '
+}
+
+function Start-Hy2QianyiProcess([string] $Executable, [string[]] $Arguments, [bool] $ReadOutput) {
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $Executable
+    $info.Arguments = Join-Hy2QianyiArguments $Arguments
+    $info.UseShellExecute = $false
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $ReadOutput
+    return [Diagnostics.Process]::Start($info)
+}
+
+function Get-Hy2QianyiRemoteCommand([ValidateSet('export-ssh', 'import-ssh')][string] $Action) {
+    $bootstrap = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Hy2QianyiLinuxBootstrap))
+    # Decode only the shell command. The original standard input still carries the snapshot.
+    return ('bash -c "$(printf %s ' + $bootstrap + ' | base64 -d)" hy2qianyi ' + $Hy2QianyiPythonHash + ' ' + $Action)
+}
+
+function Start-Hy2QianyiSsh($Endpoint, [string] $Key, [string] $Action) {
+    $ssh = (Get-Command ssh.exe -CommandType Application | Select-Object -First 1).Source
+    $arguments = @(
+        '-T', '-a', '-x',
+        '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+        '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'AddKeysToAgent=no',
+        '-o', 'PreferredAuthentications=publickey',
+        '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no',
+        '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+        '-i', $Key, '-p', [string] $Endpoint.Port, "root@$($Endpoint.Address)",
+        (Get-Hy2QianyiRemoteCommand $Action)
+    )
+    return (Start-Hy2QianyiProcess $ssh $arguments ($Action -eq 'export-ssh'))
+}
+
+function Close-Hy2QianyiProcess($Process) {
+    if ($null -ne $Process) {
+        try {
+            if (-not $Process.HasExited) {
+                try { $Process.Kill() } catch [InvalidOperationException] {}
+            }
+        }
+        finally { $Process.Dispose() }
+    }
+}
+
+function Copy-Hy2QianyiFrame([IO.Stream] $InputStream, [IO.MemoryStream] $Destination) {
+    $buffer = [byte[]]::new(65536)
+    try {
+        while (($length = $InputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($Destination.Length + $length -gt $Hy2QianyiFrameLimit) {
+                throw '源机返回的数据超过迁移大小限制。'
+            }
+            $Destination.Write($buffer, 0, $length)
+        }
+    }
+    finally { [Array]::Clear($buffer, 0, $buffer.Length) }
+}
+
+function Invoke-Hy2QianyiTransfer($Source, $Target, [string] $Key) {
+    $packet = [IO.MemoryStream]::new($Hy2QianyiFrameLimit)
+    $sender = $null
+    $receiver = $null
+    try {
+        Write-Host "正在从源机 $($Source.Address) 读取节点快照..."
+        $sender = Start-Hy2QianyiSsh $Source $Key 'export-ssh'
+        $sender.StandardInput.BaseStream.Dispose()
+        Copy-Hy2QianyiFrame $sender.StandardOutput.BaseStream $packet
+        $sender.WaitForExit()
+        if ($sender.ExitCode -ne 0 -or $packet.Length -eq 0) {
+            throw "源机导出失败，迁移停在源机阶段（SSH 退出码 $($sender.ExitCode)）。"
+        }
+
+        Write-Host "正在向目标机 $($Target.Address) 交付快照并接管节点..."
+        $packet.Position = 0
+        $receiver = Start-Hy2QianyiSsh $Target $Key 'import-ssh'
+        $targetPipe = $receiver.StandardInput.BaseStream
+        try { $packet.CopyTo($targetPipe) }
+        finally { $targetPipe.Dispose() }
+        $receiver.WaitForExit()
+        if ($receiver.ExitCode -ne 0) {
+            throw "目标机未报告迁移完成（SSH 退出码 $($receiver.ExitCode)）。请查看上方报错。"
+        }
+    }
+    finally {
+        try { Close-Hy2QianyiProcess $receiver }
+        finally {
+            try { Close-Hy2QianyiProcess $sender }
+            finally {
+                [Array]::Clear($packet.GetBuffer(), 0, [int] $packet.Length)
+                $packet.Dispose()
+            }
+        }
+    }
+}
+
+function Invoke-Hy2Qianyi {
+    $source = Read-Hy2QianyiEndpoint '源机' '源机公网 IPv4（现在正在用的 VPS）'
+    $target = Read-Hy2QianyiEndpoint '目标机' '目标机公网 IPv4（准备接班的 VPS）'
+    if ($source.Address -eq $target.Address -and $source.Port -eq $target.Port) {
+        throw '源机和目标机填成了同一个 SSH 地址。'
+    }
+    $key = Find-Hy2QianyiKey
+    Write-Host "迁移方向 $($source.Address):$($source.Port) → $($target.Address):$($target.Port)。目标机的 443 和同端口节点会被接管。"
+    Write-Host '如果出现 Enter passphrase，请输入这把 SSH 私钥的口令。输入时不会显示字符。'
+    Invoke-Hy2QianyiTransfer $source $target $key
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Hy2Qianyi
+}
