@@ -1373,7 +1373,9 @@ class GuardHost(Host):
         return previous
 
     def source_blacklist(self, ports):
-        with self.blacklist_lock():
+        lock_exists = exists("/run/lock/hy2-manual-guard.lock")
+        require(lock_exists or not exists(GUARD_STATE), "源手工防火墙缺少原生锁，请先检查组件")
+        with self.blacklist_lock() if lock_exists else contextlib.nullcontext():
             previous = self.guard_verify()
             return set() if previous is None else {x for x in guard_state(previous)[1] if x[0] in ports}
 

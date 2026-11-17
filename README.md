@@ -27,7 +27,7 @@
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $body = $client.DownloadData('https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.ps1')
         $hash = ([BitConverter]::ToString($sha256.ComputeHash($body))).Replace('-', '').ToLowerInvariant()
-        if ($hash -ne '44a750f30c0846de9686cd060b56f63836b07a415d93b57b0ab236cb2542531b') { throw '启动脚本校验失败，请重新打开 README 获取最新命令。' }
+        if ($hash -ne 'b5e8d6123a3d8329fe23e4a6075c97900642c63b0ee9162b671e013a48ca60a6') { throw '启动脚本校验失败，请重新打开 README 获取最新命令。' }
     }
     finally {
         [Net.ServicePointManager]::SecurityProtocol = $previousTls
@@ -55,7 +55,7 @@
   trap 'exit 129' HUP
   curl --proto '=https' -fsSL --max-time 90 \
     https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
-  printf '%s  %s\n' '8ddf45149af35ac7ee0e5bbb0d928cbfc5428b20470da5a9ad6c0ad6af764fda' "$d/hy2qianyi.py" | sha256sum -c -
+  printf '%s  %s\n' '64597ce5992d99fa9a246df36c4709d9bb45d2693a771af5e64ea279b33f43db' "$d/hy2qianyi.py" | sha256sum -c -
   python3 -I -B "$d/hy2qianyi.py" send
 )
 ```

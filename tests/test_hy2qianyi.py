@@ -806,5 +806,21 @@ class TransportTests(unittest.TestCase):
                 self.assertFalse(list(root.glob("hy2qianyi.*")))
 
 
+class ExportCleanupTests(unittest.TestCase):
+    def test_export_without_guard_does_not_create_runtime_lock(self):
+        host = q.Host(Path("/unused"))
+        with patch.object(q, "exists", return_value=False), \
+                patch.object(host, "blacklist_lock", side_effect=AssertionError("must not create a lock")), \
+                patch.object(host, "guard_verify", return_value=None):
+            self.assertEqual(host.source_blacklist({443}), set())
+
+    def test_guard_state_without_native_lock_is_rejected_read_only(self):
+        host = q.Host(Path("/unused"))
+        with patch.object(q, "exists", side_effect=lambda p: p == q.GUARD_STATE), \
+                patch.object(host, "blacklist_lock", side_effect=AssertionError("must not create a lock")):
+            with self.assertRaises(q.MigrationError):
+                host.source_blacklist({443})
+
+
 if __name__ == "__main__":
     unittest.main()
