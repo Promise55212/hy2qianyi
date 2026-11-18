@@ -31,9 +31,9 @@ if os.name == "nt":
 import hy2qianyi as q
 
 
-def node(tag, port, *, quota=False, iplimit=False, nat=False, label="source"):
+def node(tag, port, *, quota=False, iplimit=False, nat=False, label="source",
+         domain="migration.example.org"):
     main = tag == "main"
-    domain = "migration.example.org"
     password = f"{label}-{port}-fixture-password"
     meta = dict(STATE_SCHEMA="1", HY_DOMAIN=domain, MASQ_URL="https://www.example.org/",
                 ENABLE_SALAMANDER="0", SALAMANDER_PASSWORD="")
@@ -88,9 +88,19 @@ def render(value):
     return result
 
 
+def tls_fixture(label):
+    body = base64.b64encode(label.encode())
+    return {"cert": b"-----BEGIN CERTIFICATE-----\n" + body + b"\n-----END CERTIFICATE-----\n",
+            "key": b"-----BEGIN PRIVATE KEY-----\n" + body + b"\n-----END PRIVATE KEY-----\n"}
+
+
 def packet(nodes, origin="a" * 64, **extra):
-    return q.encode_json(dict(format=q.FORMAT, origin=origin, profile={"test": "profile"},
-                              nodes=[asdict(n) for n in nodes], blacklist=[], daily=None, **extra))
+    tls = {domain: {name: base64.b64encode(raw).decode() for name, raw in tls_fixture(domain).items()}
+           for domain in {n.meta["HY_DOMAIN"] for n in nodes}}
+    fields = dict(format=q.FORMAT, origin=origin, profile={"test": "profile"},
+                  nodes=[asdict(n) for n in nodes], blacklist=[], daily=None, tls=tls)
+    fields.update(extra)
+    return q.encode_json(fields)
 
 
 class FakeHost(q.Host):
@@ -117,6 +127,12 @@ class FakeHost(q.Host):
 
     def test_config(self, value):
         q.validate_node(value)
+
+    def validate_tls_files(self, _domain, cert, key):
+        cert_body = Path(cert).read_bytes().splitlines()[1]
+        key_body = Path(key).read_bytes().splitlines()[1]
+        if cert_body != key_body:
+            raise q.MigrationError("fixture TLS certificate and key do not match")
 
     def check_unit(self, value):
         if not Path(q.SYSTEMD, value.unit).is_file():
@@ -227,11 +243,14 @@ class TransactionTests(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         state, systemd, cfg, run = (root / name for name in ("state", "systemd", "config", "run"))
-        for path in (state / "temp", state / "main", state / "quota", state / "iplimit", systemd, cfg / "temp", run):
+        cert_root = cfg / "certs"
+        for path in (state / "temp", state / "main", state / "quota", state / "iplimit", systemd,
+                     cfg / "temp", cert_root, run):
             path.mkdir(parents=True)
         main = {"meta": str(state / "main/main.env"), "config": str(cfg / "main.yaml"),
                 "url": str(root / "main.url"), "password": str(state / "main/main.password")}
         updates = dict(STATE=str(state), LOCK_DIR=str(run), SYSTEMD=str(systemd), XRAY_DIR=str(cfg),
+                       CERT_ROOT=cert_root,
                        MAIN_FILES=main, MAIN_SUB=str(root / "main.sub"), MAIN_DEFAULTS=str(root / "defaults"),
                        JOURNAL=str(state / ".hy2qianyi-recovery.json"), LEGACY={},
                        permit_file=lambda table: run / f"{table}.permit")
@@ -255,6 +274,16 @@ class TransactionTests(unittest.TestCase):
         self.host.active_units.update(n.unit for n in (self.main, self.old, self.keep))
         self.host.enabled_units.update(self.host.active_units)
 
+    def save_tls_fixture(self, domain, label):
+        fixture = tls_fixture(label)
+        for kind, path in q.tls_paths(domain).items():
+            path.parent.mkdir(mode=0o700, exist_ok=True)
+            q.write_file(path, fixture[kind], mode=0o600)
+        return fixture
+
+    def read_tls(self, domain):
+        return {name: path.read_bytes() for name, path in q.tls_paths(domain).items()}
+
     def current(self, port):
         return self.host.read_node(self.host.inventory()[port])
 
@@ -263,7 +292,84 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(self.host.fences)
         self.assertFalse(list(Path(q.SYSTEMD).glob("*.service.d")))
         self.assertFalse(list(self.host.work.glob("*.permit")))
+        self.assertFalse(list(self.host.work.glob("tls-check-*")))
         self.assertFalse(list(Path(q.STATE).rglob("*.hy2qianyi-new")))
+        self.assertFalse(list(q.CERT_ROOT.rglob("*.hy2qianyi-new")))
+
+    def test_default_import_adopts_tls_domain_and_preserves_target_only_certificate(self):
+        original_domain = self.main.meta["HY_DOMAIN"]
+        target_tls = self.save_tls_fixture(original_domain, "target only")
+        source_domain = "source.example.org"
+        incoming = node("main", 443, domain=source_domain)
+        additional = node("hy2-temp-add", 40003, domain=source_domain)
+        q.apply_bundle(self.host, packet([incoming, additional]))
+        self.assertEqual(self.read_tls(source_domain), tls_fixture(source_domain))
+        self.assertEqual(self.read_tls(original_domain), target_tls)
+        self.assertEqual(self.current(443).url, incoming.url)
+        self.assertEqual(self.current(40003).url, additional.url)
+        self.assertEqual(self.current(self.keep.port).url, self.keep.url)
+        self.assertIn(f"HY_DOMAIN={source_domain}\n", Path(q.MAIN_DEFAULTS).read_text())
+        self.assert_clean()
+
+    def test_failed_import_removes_copied_tls_and_restores_old_domain(self):
+        original_domain = self.main.meta["HY_DOMAIN"]
+        target_tls = self.save_tls_fixture(original_domain, "target only")
+        source_domain = "source.example.org"
+        incoming = node("main", 443, domain=source_domain)
+        self.host.fail_start = incoming.unit
+        with self.assertRaisesRegex(q.MigrationError, "simulated start failure"):
+            q.apply_bundle(self.host, packet([incoming]))
+        self.assertFalse((q.CERT_ROOT / source_domain).exists())
+        self.assertEqual(self.read_tls(original_domain), target_tls)
+        self.assertEqual(self.current(443).url, self.main.url)
+        self.assertEqual(Path(q.MAIN_DEFAULTS).read_bytes(), self.defaults)
+        self.assert_clean()
+
+    def test_failed_import_restores_preexisting_files_for_incoming_domain(self):
+        domain = self.main.meta["HY_DOMAIN"]
+        self.save_tls_fixture(domain, "previous certificate")
+        key = q.tls_paths(domain)["key"]
+        q.write_file(key, tls_fixture("previous mismatched key")["key"], mode=0o600)
+        old = self.read_tls(domain)
+        incoming = node("main", 443)
+        self.host.fail_start = incoming.unit
+        with self.assertRaisesRegex(q.MigrationError, "simulated start failure"):
+            q.apply_bundle(self.host, packet([incoming]))
+        self.assertEqual(self.read_tls(domain), old)
+        self.assertEqual(self.current(443).url, self.main.url)
+        self.assert_clean()
+
+    def test_import_reuses_existing_valid_certificate_for_incoming_domain(self):
+        domain = "source.example.org"
+        preexisting = self.save_tls_fixture(domain, "target matching certificate")
+        q.apply_bundle(self.host, packet([node("main", 443, domain=domain)]))
+        self.assertEqual(self.read_tls(domain), preexisting)
+        self.assert_clean()
+
+    def test_mismatched_certificate_is_rejected_before_changing_target(self):
+        incoming = node("main", 443, domain="source.example.org")
+        raw = q.decode_json(packet([incoming]))
+        raw["tls"][incoming.meta["HY_DOMAIN"]]["key"] = base64.b64encode(tls_fixture("unmatched")["key"]).decode()
+        with self.assertRaisesRegex(q.MigrationError, "certificate and key do not match"):
+            q.apply_bundle(self.host, q.encode_json(raw))
+        self.assertEqual(self.host.actions, [])
+        self.assertEqual(self.current(443).url, self.main.url)
+        self.assert_clean()
+
+    def test_default_export_includes_certificate_and_key_with_no_source_mutation(self):
+        domain = self.main.meta["HY_DOMAIN"]
+        source_tls = self.save_tls_fixture(domain, "source")
+        self.host.actions.clear()
+        before = {kind: path.stat().st_mtime_ns for kind, path in q.tls_paths(domain).items()}
+        _, _, nodes, _, _, exported_tls = q.decode_bundle(q.source_bundle(self.host))
+        self.assertEqual({value.port for value in nodes}, {443, self.old.port, self.keep.port})
+        self.assertEqual(exported_tls, {
+            domain: {kind: base64.b64encode(material).decode() for kind, material in source_tls.items()}
+        })
+        self.assertEqual(self.read_tls(domain), source_tls)
+        self.assertEqual({kind: path.stat().st_mtime_ns for kind, path in q.tls_paths(domain).items()}, before)
+        self.assertEqual(self.host.actions, [])
+        self.assert_clean()
 
     def test_replace_matching_port_keep_disjoint_and_remap_tag(self):
         incoming = node("main", 443, quota=True)
@@ -303,10 +409,13 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(q.MigrationError):
             q.apply_bundle(self.host, packet([node("main", 443), new]))
         self.assertEqual(q.journal_read()["phase"], "publish")
+        domain = new.meta["HY_DOMAIN"]
+        q.pending_file(q.tls_paths(domain)["key"]).write_bytes(b"interrupted test write")
         live = dict(new.quota, SAVED_USED_BYTES="70", LIMIT_BYTES="30")
         q.write_file(q.policy_paths(40000)["quota"], q.env_encode(live))
         q.recover_target(self.host)
         self.assertEqual(self.current(40000).quota["LIMIT_BYTES"], "30")
+        self.assertEqual(self.read_tls(domain), tls_fixture(domain))
         self.assert_clean()
 
     def test_foreign_listener_rejected_before_mutation(self):
@@ -502,6 +611,22 @@ class TransactionTests(unittest.TestCase):
         module.collect.assert_not_called()
         self.assertFalse(q.daily_path().exists())
 
+    def test_missing_target_daily_component_refuses_before_replacing_services(self):
+        incoming = node("main", 443)
+        record = dict(tag=incoming.tag, port=incoming.port, key=q.daily_key(incoming),
+                      days={"2026-11-17": {"upload": 10, "download": 20}},
+                      sampled_at="2026-11-17T12:00:00+08:00")
+        daily = {"program_sha256": q.TRAFFIC_SHA256, "users": {incoming.tag: record}}
+        active_units = set(self.host.active_units)
+        program = self.host.work / "missing-traffic.py"
+        with patch.object(q, "TRAFFIC_PROGRAM", str(program)):
+            with self.assertRaisesRegex(q.MigrationError, "预先部署匹配版本的 hy2_traffic"):
+                q.apply_bundle(self.host, packet([incoming], daily=daily))
+            self.assertFalse(any(path.exists() for path in q.daily_files()))
+        self.assertEqual(self.current(443).url, self.main.url)
+        self.assertEqual(self.host.active_units, active_units)
+        self.assert_clean()
+
 
 class ValidationTests(unittest.TestCase):
     def test_standard_main_temp_and_nat_configs(self):
@@ -558,11 +683,48 @@ class ValidationTests(unittest.TestCase):
 
     def test_bundle_does_not_include_wireguard_private_key(self):
         raw = q.decode_json(packet([node("main", 443), node("hy2-temp-nat", 40000, nat=True)]))
-        self.assertEqual(set(raw), {"format", "origin", "profile", "nodes", "blacklist", "daily"})
+        self.assertEqual(set(raw), {"format", "origin", "profile", "nodes", "blacklist", "daily", "tls"})
         self.assertNotIn("PrivateKey", q.encode_json(raw).decode())
         self.assertNotIn("/etc/wireguard/", q.encode_json(raw).decode())
 
+    def test_default_packet_requires_exact_tls_domains_and_key_pairs(self):
+        incoming = node("main", 443)
+        domain = incoming.meta["HY_DOMAIN"]
+        good = q.decode_json(packet([incoming]))
+        cases = [None, {}, {"../wrong": good["tls"][domain]}, {domain: {"cert": "bm90IGEga2V5"}},
+                 {domain: {"cert": "invalid!", "key": "invalid!"}}]
+        for tls in cases:
+            with self.subTest(tls=tls), self.assertRaises(q.MigrationError):
+                q.decode_bundle(packet([incoming], tls=tls))
+
 class NativeAdapterTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_tls_validation_checks_trusted_hostname_and_matching_private_key(self):
+        work = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        host = q.Host(work)
+        domain = "source.example.org"
+        ca_key, ca_cert = work / "ca.key", work / "ca.pem"
+        request, key, cert = work / "leaf.csr", work / "leaf.key", work / "chain.pem"
+        leaf = work / "leaf.pem"
+
+        def openssl(*args):
+            subprocess.run(["openssl", *map(str, args)], check=True, capture_output=True, timeout=10)
+
+        openssl("req", "-x509", "-newkey", "ed25519", "-nodes", "-days", 1,
+                "-subj", "/CN=Migration fixture CA", "-addext", "basicConstraints=critical,CA:TRUE",
+                "-keyout", ca_key, "-out", ca_cert)
+        openssl("req", "-new", "-newkey", "ed25519", "-nodes", "-subj", f"/CN={domain}",
+                "-addext", f"subjectAltName=DNS:{domain}", "-keyout", key, "-out", request)
+        openssl("x509", "-req", "-in", request, "-CA", ca_cert, "-CAkey", ca_key,
+                "-set_serial", 1, "-days", 1, "-copy_extensions", "copy", "-out", leaf)
+        cert.write_bytes(leaf.read_bytes() + ca_cert.read_bytes())
+        with patch.dict(os.environ, {"SSL_CERT_FILE": str(ca_cert)}):
+            host.validate_tls_files(domain, cert, key)
+            with self.assertRaises(q.MigrationError):
+                host.validate_tls_files("other.example.org", cert, key)
+            with self.assertRaises(q.MigrationError):
+                host.validate_tls_files(domain, cert, ca_key)
+
     def nat_host(self, *, handshake=None, wrong_peer=False, prohibit=True):
         host = q.Host(Path("/run"))
         now = int(time.time())

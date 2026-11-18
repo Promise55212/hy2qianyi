@@ -28,18 +28,20 @@ import sys
 import time
 from types import ModuleType
 from urllib.parse import parse_qs, unquote, urlsplit
-from urllib.request import urlopen
 
 
-FORMAT = 2
+FORMAT = 3
+LEGACY_JOURNAL_FORMAT = 2
 MAX_PACKET = 32 * 1024 * 1024
 MAX_STATE_FILE = 1024 * 1024
+MAX_TLS_FILE = 64 * 1024
 SSH_FRAME = re.compile(rb"HY2SSH1 ([1-9][0-9]{0,8}) ([0-9a-f]{64})\n")
 MAX_SSH_PREAMBLE = 8192
 SOURCE_URL = "https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py"
 STATE = "/var/lib/hy2"
 LOCK_DIR = "/run/hy2"
 XRAY_DIR = "/etc/hysteria"
+CERT_ROOT = Path("/etc/hysteria/certs")
 XRAY = "/usr/local/bin/hysteria"
 SYSTEMD = "/etc/systemd/system"
 LIB = "/usr/local/lib/hy2"
@@ -55,7 +57,6 @@ MAIN_DEFAULTS = "/etc/default/hy2-main"
 JOURNAL = f"{STATE}/.hy2qianyi-recovery.json"
 TRAFFIC_PROGRAM = "/usr/local/sbin/hy2_traffic"
 TRAFFIC_SHA256 = "7fb3904d95d3b4e59f03662c7dbc107749380dc4422e8fba218b1631eb824de4"
-TRAFFIC_URL = "https://raw.githubusercontent.com/liucong552-art/hy2jieshu/ca4569d1192da6ad6ba1530faeb0b01815935bc0/traffic.py"
 TRAFFIC_TABLE = "hy2_daily_traffic"
 TRAFFIC_UNITS = {
     "hy2-traffic.service": """[Unit]
@@ -593,9 +594,53 @@ def ban_entries(rows, ports):
 
 
 
+def tls_paths(domain):
+    directory = CERT_ROOT / domain
+    return {"cert": directory / "fullchain.pem", "key": directory / "privkey.pem"}
+
+
+def tls_bytes(value):
+    require(isinstance(value, str) and len(value) <= 4 * ((MAX_TLS_FILE + 2) // 3),
+            "TLS 迁移材料格式或大小无效")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except ValueError:
+        raise MigrationError("TLS 迁移材料的 Base64 编码无效") from None
+    require(0 < len(data) <= MAX_TLS_FILE, "TLS 迁移材料为空或超过限制")
+    return data
+
+
+def tls_domains(nodes):
+    return {node.meta["HY_DOMAIN"] for node in nodes}
+
+
+def validate_tls_bundle(tls, nodes):
+    require(isinstance(tls, dict) and set(tls) == tls_domains(nodes), "TLS 迁移材料与节点域名不匹配")
+    for pair in tls.values():
+        require(isinstance(pair, dict) and set(pair) == {"cert", "key"}, "TLS 迁移包缺少证书或私钥")
+        for value in pair.values():
+            tls_bytes(value)
+
+
+def validate_tls_backup(tls, nodes):
+    require(isinstance(tls, dict) and set(tls) <= tls_domains(nodes), "TLS 恢复材料与节点域名不匹配")
+    for record in tls.values():
+        require(isinstance(record, dict) and set(record) == {"directory", "cert", "key"}
+                and type(record["directory"]) is bool, "TLS 恢复材料格式无效")
+        for key in ("cert", "key"):
+            file = record[key]
+            if file is not None:
+                require(record["directory"] and isinstance(file, dict) and set(file) == {"data", "mode"}
+                        and type(file["mode"]) is int and 0 <= file["mode"] <= 0o777
+                        and not file["mode"] & 0o022, "TLS 恢复文件属性无效")
+                require(isinstance(file["data"], str), "TLS 恢复文件内容无效")
+                if file["data"]:  # An existing empty file must also be restored exactly.
+                    tls_bytes(file["data"])
+
+
 def decode_bundle(packet):
     bundle = decode_json(packet)
-    fields = {"format", "profile", "nodes", "origin"}
+    fields = {"format", "profile", "nodes", "origin", "tls"}
     require(isinstance(bundle, dict) and set(bundle) - {"blacklist", "daily"} == fields
             and bundle["format"] == FORMAT and isinstance(bundle["origin"], str) and HEX.fullmatch(bundle["origin"]),
             "迁移包版本不支持")
@@ -608,7 +653,8 @@ def decode_bundle(packet):
     daily = bundle.get("daily")
     if daily is not None:
         validate_daily_payload(daily, nodes)
-    return bundle["origin"], bundle["profile"], nodes, bans, daily
+    validate_tls_bundle(bundle["tls"], nodes)
+    return bundle["origin"], bundle["profile"], nodes, bans, daily, bundle["tls"]
 
 
 def normalized_unit(text):
@@ -900,27 +946,12 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
 
 
     def prepare_daily(self, daily, incoming, nodes):
-        installed = exists(TRAFFIC_PROGRAM)
-        if installed:
-            program = secure_read(TRAFFIC_PROGRAM)
-        else:
-            require(not exists(daily_path()) and TRAFFIC_TABLE not in self.tables(),
-                    "目标机有每日流量残留但缺少原生统计程序，请先检查")
-            for name in TRAFFIC_UNITS:
-                path = Path(SYSTEMD) / name
-                require(not exists(path) and not exists(path.parent / f"{name}.d")
-                        and self.property(name, "LoadState") == "not-found",
-                        f"目标机已有无法归属的每日流量服务 {name}")
-            try:
-                with urlopen(TRAFFIC_URL, timeout=25) as response:
-                    program = response.read(MAX_STATE_FILE + 1)
-            except OSError:
-                raise MigrationError("目标机下载原生每日流量组件失败，请检查 GitHub 网络") from None
+        require(exists(TRAFFIC_PROGRAM), "源快照含每日流量历史，目标机需预先部署匹配版本的 hy2_traffic")
+        program = secure_read(TRAFFIC_PROGRAM)
         self.daily_module(program)
-        paths = daily_files() if not installed else {daily_path()}
-        for path in paths:
-            require(path.resolve() == path and not exists(pending_file(path)),
-                    f"每日流量路径异常或有未完成写入 {path}")
+        path = daily_path()
+        require(path.resolve() == path and not exists(pending_file(path)),
+                f"每日流量路径异常或有未完成写入 {path}")
         records = {}
         for original, node in zip(incoming, nodes, strict=True):
             if original.tag in daily["users"]:
@@ -928,7 +959,7 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
                 record.update(tag=node.tag, port=node.port, key=daily_key(node))
                 records[node.tag] = record
         validate_daily_records(records, nodes)
-        return {"install": not installed, "directory_created": not daily_path().parent.exists(),
+        return {"install": False, "directory_created": False,
                 "program": base64.b64encode(program).decode(), "incoming": records, "before": {}}
 
     def capture_daily_before(self, plan, old):
@@ -955,10 +986,6 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
         module.save_state(daily_path(), state)
 
     def apply_daily(self, plan):
-        if plan["install"]:
-            write_file(TRAFFIC_PROGRAM, base64.b64decode(plan["program"], validate=True), 0o755)
-            for name, content in TRAFFIC_UNITS.items():
-                write_file(Path(SYSTEMD) / name, content.encode(), 0o644)
         self.merge_daily(plan, plan["incoming"])
         self.verify_daily(plan)
 
@@ -982,6 +1009,7 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
 
     def finish_daily(self, plan):
         self.verify_daily(plan)
+        # Complete older, already-committed transactions that installed traffic units.
         if plan["install"]:
             for name, content in TRAFFIC_UNITS.items():
                 require(secure_read(Path(SYSTEMD) / name) == content.encode(), "每日流量服务归属异常")
@@ -1208,26 +1236,92 @@ WantedBy=multi-user.target
         node.meta.update(MARK=str(mark), TABLE_ID=str(table), RULE_PRIORITY=str(priority),
                          OIF_RULE_PRIORITY=oif_priority)
 
-    def test_config(self, node):
-        validate_node(node)
-        target = self.inventory()[443].meta
-        require(target.get("HY_DOMAIN") == node.meta.get("HY_DOMAIN"),
-                "目标机主域名必须与源节点 HY_DOMAIN 一致，请先在目标部署同域证书及续期配置")
-        domain = node.meta["HY_DOMAIN"]
-        cert = f"/etc/hysteria/certs/{domain}/fullchain.pem"
-        key = f"/etc/hysteria/certs/{domain}/privkey.pem"
-        secure_read(cert)
-        secure_read(key)
-        self.run("openssl", "x509", "-in", cert, "-noout", "-checkend", "0", "-checkhost", domain)
+    def source_tls(self, nodes):
+        return {domain: {kind: base64.b64encode(secure_read(path, MAX_TLS_FILE)).decode("ascii")
+                         for kind, path in tls_paths(domain).items()}
+                for domain in sorted(tls_domains(nodes))}
+
+    def validate_tls_files(self, domain, cert, key):
         extensions = self.run("openssl", "x509", "-in", cert, "-noout", "-ext", "subjectAltName").stdout
         names = {name.lower() for name in re.findall(r"DNS:([^,\s]+)", extensions)}
         require(domain.lower() in names or any(name.startswith("*.")
                     and domain.lower().split(".", 1)[-1] == name[2:]
                     and len(domain.split(".")) == len(name.split(".")) for name in names),
-                "目标 TLS 证书的 SAN 未覆盖 HY_DOMAIN")
+                f"TLS 证书的 SAN 未覆盖 {domain}")
+        result = self.run("openssl", "verify", "-purpose", "sslserver", "-verify_hostname", domain,
+                          "-untrusted", cert, cert, check=False)
+        require(result.returncode == 0, f"TLS 证书链不受信任或证书已失效 {domain}")
         public_cert = self.run("openssl", "x509", "-in", cert, "-pubkey", "-noout").stdout.strip()
-        public_key = self.run("openssl", "pkey", "-in", key, "-pubout").stdout.strip()
-        require(public_cert and public_cert == public_key, "目标 TLS 证书与私钥不配对")
+        public_key = self.run("openssl", "pkey", "-in", key, "-passin", "pass:", "-pubout").stdout.strip()
+        require(public_cert and public_cert == public_key, f"TLS 证书与私钥不配对 {domain}")
+
+    def prepare_tls(self, tls, nodes):
+        require(CERT_ROOT.is_dir() and CERT_ROOT.resolve() == CERT_ROOT, "目标 TLS 证书根目录异常")
+        previous = {}
+        for domain in sorted(tls_domains(nodes)):
+            paths = tls_paths(domain)
+            directory = paths["cert"].parent
+            existed = exists(directory)
+            require(directory.resolve() == directory and (not existed or directory.is_dir()),
+                    f"目标 TLS 证书目录异常 {domain}")
+            require(not any(exists(pending_file(path)) for path in paths.values()),
+                    f"目标还有未归属的 TLS 临时文件 {domain}")
+            pair = tls[domain]
+            staged = {kind: self.work / f"tls-check-{kind}.pem" for kind in paths}
+            try:
+                for kind, path in staged.items():
+                    write_file(path, tls_bytes(pair[kind]))
+                self.validate_tls_files(domain, staged["cert"], staged["key"])
+            finally:
+                for path in staged.values():
+                    remove_file(path)
+
+            backup = {"directory": existed}
+            for kind, path in paths.items():
+                backup[kind] = None
+                if exists(path):
+                    data = secure_read(path, MAX_TLS_FILE)
+                    backup[kind] = {"data": base64.b64encode(data).decode("ascii"),
+                                    "mode": stat.S_IMODE(path.stat().st_mode) & 0o777}
+            if backup["cert"] and backup["key"]:
+                try:
+                    self.validate_tls_files(domain, paths["cert"], paths["key"])
+                except MigrationError:
+                    pass
+                else:
+                    continue
+            previous[domain] = backup
+        return previous
+
+    def install_tls(self, tls, previous):
+        for domain, backup in previous.items():
+            paths = tls_paths(domain)
+            if not backup["directory"]:
+                paths["cert"].parent.mkdir(mode=0o700)
+                fsync_directory(CERT_ROOT)
+            for kind, path in paths.items():
+                write_file(path, tls_bytes(tls[domain][kind]))
+
+    def restore_tls(self, previous):
+        for domain, backup in previous.items():
+            paths = tls_paths(domain)
+            directory = paths["cert"].parent
+            require(directory.resolve() == directory, f"恢复时 TLS 证书目录异常 {domain}")
+            for kind, path in paths.items():
+                prior = backup[kind]
+                if prior is None:
+                    remove_file(path)
+                else:
+                    write_file(path, base64.b64decode(prior["data"], validate=True), prior["mode"])
+            if not backup["directory"] and directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+                fsync_directory(CERT_ROOT)
+
+    def test_config(self, node):
+        validate_node(node)
+        domain = node.meta["HY_DOMAIN"]
+        cert = f"/etc/hysteria/certs/{domain}/fullchain.pem"
+        key = f"/etc/hysteria/certs/{domain}/privkey.pem"
         path = self.work / "check.yaml"
         try:
             listen = node.meta["HY_LISTEN"] if node.main else node.meta["LISTEN_ADDR"]
@@ -1473,9 +1567,12 @@ def source_bundle(host):
         profile = host.profile(any(node.nat for node in nodes))
         blacklist = host.source_blacklist(set(by_port))
         daily = host.source_daily(nodes)
+        tls = host.source_tls(nodes)
+        validate_tls_bundle(tls, nodes)
         require(len(blacklist) <= MAX_BANS, "待迁黑名单条目超过大小限制")
         packet = encode_json({"format": FORMAT, "origin": host.identity(), "profile": profile,
-                              "nodes": [asdict(node) for node in nodes], "blacklist": sorted(blacklist), "daily": daily})
+                              "nodes": [asdict(node) for node in nodes], "blacklist": sorted(blacklist),
+                              "daily": daily, "tls": tls})
         require(len(packet) <= MAX_PACKET and len(nodes) <= 512, "节点数量或迁移包超过限制")
         return packet
 
@@ -1493,8 +1590,12 @@ def journal_write(tx):
 def journal_read():
     data = decode_json(secure_read(JOURNAL, MAX_PACKET * 2))
     fields = {"format", "fence", "phase", "new", "old", "defaults", "main_subscription"}
-    require(isinstance(data, dict) and set(data) - {"blacklist", "daily"} == fields
-            and data["format"] == FORMAT and isinstance(data["fence"], str) and FENCE.fullmatch(data["fence"])
+    require(isinstance(data, dict) and type(data.get("format")) is int
+            and data["format"] in {FORMAT, LEGACY_JOURNAL_FORMAT}, "恢复文件版本不支持")
+    if data["format"] == FORMAT:
+        fields.add("target_tls")
+    require(set(data) - {"blacklist", "daily"} == fields
+            and isinstance(data["fence"], str) and FENCE.fullmatch(data["fence"])
             and data["phase"] in {"prepare", "restore", "rollback_done", "publish"}
             and isinstance(data["old"], list) and isinstance(data["new"], list), "恢复文件格式不支持")
     new, old = transaction_nodes(data)
@@ -1513,6 +1614,8 @@ def journal_read():
         ban_plan_state(data["blacklist"], {node.port for node in new})
     if "daily" in data:
         validate_daily_plan(data["daily"], new, [node for _, node in old])
+    if "target_tls" in data:
+        validate_tls_backup(data["target_tls"], new)
     return data
 
 
@@ -1529,8 +1632,10 @@ def transaction_files(nodes):
     return paths
 
 
-def clean_pending(nodes, table, *, blacklist=False, daily=None):
+def clean_pending(nodes, table, *, blacklist=False, daily=None, target_tls=None):
     paths = transaction_files(nodes) | {permit_file(table)}
+    for domain in target_tls or {}:
+        paths.update(tls_paths(domain).values())
     if blacklist:
         paths.update(blacklist_files())
     if daily is not None:
@@ -1589,8 +1694,9 @@ def restore_target(host, tx, *, recovering=False):
     units = {node.unit for node in new + old}
     blacklist = tx.get("blacklist")
     daily = tx.get("daily")
+    target_tls = tx.get("target_tls", {})
     guarded = units | daily_guard_units(daily)
-    clean_pending(new + old, tx["fence"], blacklist=blacklist is not None, daily=daily)
+    clean_pending(new + old, tx["fence"], blacklist=blacklist is not None, daily=daily, target_tls=target_tls)
     if tx["phase"] == "restore":
         if tx["fence"] not in host.tables():
             host.fence(tx["fence"], ports)
@@ -1605,6 +1711,7 @@ def restore_target(host, tx, *, recovering=False):
         with host.policy_lock():
             host.clear_policies(ports)
             host.remove_temp_nodes(new + old)
+            host.restore_tls(target_tls)
             write_file(MAIN_DEFAULTS, base64.b64decode(tx["defaults"], validate=True))
             host.install(old)
             write_file(MAIN_SUB, base64.b64decode(tx["main_subscription"], validate=True))
@@ -1640,7 +1747,8 @@ def publish_target(host, tx, *, recovering=False):
     daily = tx.get("daily")
     if recovering:
         blacklist = tx.get("blacklist")
-        clean_pending(nodes + [node for _, node in old], tx["fence"], blacklist=blacklist is not None, daily=daily)
+        clean_pending(nodes + [node for _, node in old], tx["fence"], blacklist=blacklist is not None, daily=daily,
+                      target_tls=tx.get("target_tls"))
         if blacklist is not None:
             host.verify_blacklist(blacklist, {node.port for node in nodes})
         live = [node for node in nodes if not expired(node)]
@@ -1661,7 +1769,7 @@ def publish_target(host, tx, *, recovering=False):
 
 
 def apply_bundle(host, packet):
-    origin, profile, all_incoming, all_bans, daily = decode_bundle(packet)
+    origin, profile, all_incoming, all_bans, daily, tls = decode_bundle(packet)
     with host.temp_lock(), preserve_stops(host, {n.port for n in all_incoming}), (host.blacklist_lock() if all_bans else contextlib.nullcontext()):
         require(not exists(JOURNAL) and not exists(pending_file(Path(JOURNAL))),
                 "目标机还有未完成的接管，请先运行 recover")
@@ -1674,12 +1782,11 @@ def apply_bundle(host, packet):
             print("已跳过传输期间到期的临时节点。", flush=True)
         host.legacy()
         current = host.inventory()
-        require(current[443].meta.get("HY_DOMAIN") == next(n.meta["HY_DOMAIN"] for n in incoming if n.main),
-                "目标主节点必须预先部署同一 HY_DOMAIN 的证书及续期配置")
         nodes, conflicts = plan_nodes(incoming, current)
         ports = {node.port for node in nodes}
         requested_bans = {entry for entry in all_bans if entry[0] in ports}
         daily_plan = host.prepare_daily(daily, incoming, nodes) if daily is not None else None
+        target_tls = host.prepare_tls(tls, nodes)
         for node in nodes:
             if node.main:
                 for local_key in ("ACME_EMAIL", "ACME_SH_VERSION", "HYSTERIA_VERSION", "HYSTERIA_UPDATE_POLICY", "INSTALL_EPOCH", "MANAGER_VERSION"):
@@ -1729,6 +1836,7 @@ def apply_bundle(host, packet):
 
         tx = dict(format=FORMAT, fence=f"hy2qianyi_{secrets.token_hex(8)}", phase="prepare",
                   new=[asdict(node) for node in nodes], old=backup,
+                  target_tls=target_tls,
                   defaults=base64.b64encode(old_defaults).decode(),
                   main_subscription=base64.b64encode(old_subscription).decode())
         if blacklist is not None:
@@ -1761,6 +1869,7 @@ def apply_bundle(host, packet):
             with host.policy_lock():
                 host.clear_policies(ports)
                 host.remove_temp_nodes(old)
+                host.install_tls(tls, target_tls)
                 write_file(MAIN_DEFAULTS, new_defaults)
                 host.install(nodes)
             if blacklist is not None:
@@ -1796,6 +1905,8 @@ def apply_bundle(host, packet):
                     raise MigrationError(f"目标未完成收尾，保留恢复文件 {JOURNAL}。{recovery}") from None
             raise
         print(f"目标已接管 443，替换 {len(old) - 1} 个临时节点，新增 {len(nodes) - len(old)} 个临时节点。", flush=True)
+        if target_tls:
+            print(f"已导入 {len(target_tls)} 个域名的 TLS 证书；续期由目标原生证书管理负责。", flush=True)
         if requested_bans:
             print(f"已接续 {len(requested_bans)} 条源机黑名单。", flush=True)
         if daily_plan is not None:
