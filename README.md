@@ -34,7 +34,8 @@
         $client.Dispose()
         $sha256.Dispose()
     }
-    & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($body)))
+    $scriptText = [Text.Encoding]::UTF8.GetString($body).TrimStart([char]0xFEFF)
+    & ([ScriptBlock]::Create($scriptText))
 }
 ```
 

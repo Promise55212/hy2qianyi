@@ -8,9 +8,27 @@ $launcher = [ScriptBlock]::Create([IO.File]::ReadAllText($launcherPath, [Text.En
 
 $pythonHash = (Get-FileHash hy2qianyi.py -Algorithm SHA256).Hash.ToLowerInvariant()
 $launcherHash = (Get-FileHash hy2qianyi.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($pythonHash -ne $Hy2QianyiPythonHash -or -not (Get-Content README.md -Raw).Contains($launcherHash)) {
+$readme = Get-Content README.md -Raw -Encoding UTF8
+if ($pythonHash -ne $Hy2QianyiPythonHash -or -not $readme.Contains($launcherHash)) {
     throw 'Published bootstrap checksums do not match.'
 }
+
+$bootstrap = [regex]::Match($readme, '(?ms)^```powershell\r?\n(?<script>.*?)^```\r?$').Groups['script'].Value
+$download = '$body = $client.DownloadData(''https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.ps1'')'
+if (-not $bootstrap.Contains($download)) { throw 'Could not locate the README launcher download.' }
+# Feed the released bytes, including the BOM, through the same README bootstrap.
+$offlineBootstrap = $bootstrap.Replace($download, '$body = [IO.File]::ReadAllBytes($launcherPath)')
+& {
+    function Read-Host { throw 'Reached the first launcher prompt.' }
+    try {
+        & ([ScriptBlock]::Create($offlineBootstrap))
+        throw 'The README bootstrap did not launch the migration prompt.'
+    }
+    catch {
+        if ($_.Exception.Message -cne 'Reached the first launcher prompt.') { throw }
+    }
+}
+Write-Host 'The README bootstrap runs the released launcher from its downloaded bytes.'
 
 $script:PortPrompts = [Collections.Generic.List[string]]::new()
 $script:EndpointAnswers = [Collections.Generic.Queue[string]]::new()
