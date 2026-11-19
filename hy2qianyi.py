@@ -56,7 +56,8 @@ MAIN_SUB = "/root/hy2_main_subscription_base64.txt"
 MAIN_DEFAULTS = "/etc/default/hy2-main"
 JOURNAL = f"{STATE}/.hy2qianyi-recovery.json"
 TRAFFIC_PROGRAM = "/usr/local/sbin/hy2_traffic"
-TRAFFIC_SHA256 = "7fb3904d95d3b4e59f03662c7dbc107749380dc4422e8fba218b1631eb824de4"
+TRAFFIC_SHA256 = "ee047bbe398136de0effb1e626768e2dac078b74f0c185cffcb40c27f299caa3"
+PREVIOUS_TRAFFIC_SHA256 = "7fb3904d95d3b4e59f03662c7dbc107749380dc4422e8fba218b1631eb824de4"
 TRAFFIC_TABLE = "hy2_daily_traffic"
 TRAFFIC_UNITS = {
     "hy2-traffic.service": """[Unit]
@@ -563,7 +564,7 @@ def validate_daily_plan(plan, new, old):
     validate_daily_records(plan["incoming"], new)
     validate_daily_records(plan["before"], old)
     require(isinstance(plan["program"], str) and len(plan["program"]) <= MAX_STATE_FILE * 2
-            and sha(base64.b64decode(plan["program"], validate=True)) == TRAFFIC_SHA256,
+            and sha(base64.b64decode(plan["program"], validate=True)) in {TRAFFIC_SHA256, PREVIOUS_TRAFFIC_SHA256},
             "每日流量恢复程序校验失败")
 
 
@@ -923,8 +924,10 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
             time.sleep(1)
         raise MigrationError("等待节点稳定监听超时，请查看目标机对应的 systemd 服务")
 
-    def daily_module(self, program):
-        require(sha(program) == TRAFFIC_SHA256, "hy2_traffic 版本不支持，请先对齐原生统计组件")
+    def daily_module(self, program, *, recovering=False):
+        digest = sha(program)
+        require(digest == TRAFFIC_SHA256 or (recovering and digest == PREVIOUS_TRAFFIC_SHA256),
+                f"hy2_traffic 版本不支持，请先对齐原生统计组件（需要 SHA-256 {TRAFFIC_SHA256}）")
         module = ModuleType("hy2qianyi_native_daily")
         module.__file__ = TRAFFIC_PROGRAM
         exec(compile(program, TRAFFIC_PROGRAM, "exec"), module.__dict__)
@@ -940,7 +943,9 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
         if exists(path):
             secure_read(path, MAX_PACKET)
         try:
-            return module.collect(root=Path(STATE))
+            module.collect(root=Path(STATE))
+            # The collector adds display names to its return value for reports only.
+            return module.load_state(path)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
             raise MigrationError("每日流量采集失败，请先检查原生 hy2_traffic 是否能正常运行") from None
 
@@ -970,8 +975,8 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
                               if node.tag in state["users"]}
             validate_daily_records(plan["before"], old)
 
-    def merge_daily(self, plan, records):
-        module = self.daily_module(base64.b64decode(plan["program"], validate=True))
+    def merge_daily(self, plan, records, *, recovering=False):
+        module = self.daily_module(base64.b64decode(plan["program"], validate=True), recovering=recovering)
         state = self.collect_daily(module)
         for tag, saved in records.items():
             record = state["users"].get(tag)
@@ -989,8 +994,8 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
         self.merge_daily(plan, plan["incoming"])
         self.verify_daily(plan)
 
-    def verify_daily(self, plan):
-        module = self.daily_module(secure_read(TRAFFIC_PROGRAM))
+    def verify_daily(self, plan, *, recovering=False):
+        module = self.daily_module(secure_read(TRAFFIC_PROGRAM), recovering=recovering)
         state = module.load_state(daily_path())
         now = dt.datetime.now(module.TZ)
         nodes = module.discover(Path(STATE), now)
@@ -1007,8 +1012,8 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
                     require(day in actual["days"] and all(actual["days"][day][key] >= value
                             for key, value in count.items()), f"每日流量历史不完整 {tag}")
 
-    def finish_daily(self, plan):
-        self.verify_daily(plan)
+    def finish_daily(self, plan, *, recovering=False):
+        self.verify_daily(plan, recovering=recovering)
         # Complete older, already-committed transactions that installed traffic units.
         if plan["install"]:
             for name, content in TRAFFIC_UNITS.items():
@@ -1019,10 +1024,13 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
 
     def restore_daily(self, plan):
         if not plan["install"]:
-            self.merge_daily(plan, plan["before"])
+            self.merge_daily(plan, plan["before"], recovering=True)
             return
         require(not any(self.active(unit) for unit in TRAFFIC_UNITS),
                 "新装的每日流量组件被外部启动，请检查后再恢复")
+        if exists(TRAFFIC_PROGRAM):
+            expected = sha(base64.b64decode(plan["program"], validate=True))
+            require(sha(secure_read(TRAFFIC_PROGRAM)) == expected, "每日流量程序被外部改动")
         for name, content in TRAFFIC_UNITS.items():
             path = Path(SYSTEMD) / name
             if exists(path):
@@ -1031,7 +1039,6 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
                     self.sys("disable", name)
                 remove_file(path)
         if exists(TRAFFIC_PROGRAM):
-            require(sha(secure_read(TRAFFIC_PROGRAM)) == TRAFFIC_SHA256, "每日流量程序被外部改动")
             remove_file(TRAFFIC_PROGRAM)
         if TRAFFIC_TABLE in self.tables():
             self.nft(f"delete table inet {TRAFFIC_TABLE}")
@@ -1365,8 +1372,8 @@ fi""", node.port, "main" if node.main else "temp", node.family)
     def refresh_subscription(self):
         self.run(f"{SBIN}/hy2_temp_sub.sh", env={"HY2_TEMP_LOCK_HELD": "1"})
 
-    def daily_module(self, program):
-        module = super().daily_module(program)
+    def daily_module(self, program, *, recovering=False):
+        module = super().daily_module(program, recovering=recovering)
         module.COMMON = Path(LIB) / "common.sh"
         module.LOCKS = Path(LOCK_DIR)
         return module
@@ -1763,7 +1770,7 @@ def publish_target(host, tx, *, recovering=False):
     guarded = {node.unit for node in nodes} | {node.unit for _, node in old} | daily_guard_units(daily)
     host.clear_guards(tx["fence"], guarded)
     if daily is not None:
-        host.finish_daily(daily)
+        host.finish_daily(daily, recovering=recovering)
     host.unfence(tx["fence"])
     remove_file(JOURNAL)
 

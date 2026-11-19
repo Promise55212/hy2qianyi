@@ -611,6 +611,67 @@ class TransactionTests(unittest.TestCase):
         module.collect.assert_not_called()
         self.assertFalse(q.daily_path().exists())
 
+    def test_daily_collection_uses_persisted_state_without_display_names(self):
+        path = q.daily_path()
+        path.parent.mkdir()
+        saved = {"version": 1, "users": {self.old.tag: {"tag": self.old.tag}}}
+        display = copy.deepcopy(saved)
+        display["users"][self.old.tag]["display_name"] = "Friendly node name"
+
+        def collect(root):
+            self.assertEqual(root, Path(q.STATE))
+            path.write_bytes(q.encode_json(saved))
+            return display
+
+        module = SimpleNamespace(collect=collect,
+                                 load_state=lambda source: q.decode_json(source.read_bytes()))
+        self.assertEqual(self.host.collect_daily(module), saved)
+
+    def test_fresh_daily_migration_rejects_previous_component(self):
+        previous = b"release = 'previous'\n"
+        current = b"release = 'current'\n"
+        program = self.host.work / "traffic.py"
+        program.write_bytes(previous)
+        current_hash = q.sha(current)
+        incoming = node("main", 443)
+        daily = {"program_sha256": current_hash, "users": {}}
+        with patch.multiple(q, TRAFFIC_PROGRAM=str(program), TRAFFIC_SHA256=current_hash,
+                            PREVIOUS_TRAFFIC_SHA256=q.sha(previous)):
+            self.assertEqual(self.host.daily_module(current).release, "current")
+            with self.assertRaisesRegex(q.MigrationError, "版本不支持"):
+                q.Host.source_daily(self.host, [self.main])
+            with self.assertRaisesRegex(q.MigrationError, "版本不支持"):
+                q.apply_bundle(self.host, packet([incoming], daily=daily))
+        self.assertEqual(self.current(443).url, self.main.url)
+        self.assert_clean()
+
+    def test_published_daily_journal_can_finish_with_previous_component(self):
+        previous = b"""from datetime import timezone
+TZ = timezone.utc
+
+def load_state(path):
+    return {"users": {}}
+
+def discover(root, now):
+    return {}
+"""
+        program = self.host.work / "traffic.py"
+        program.write_bytes(previous)
+        plan = dict(install=False, directory_created=False, program=base64.b64encode(previous).decode(),
+                    incoming={}, before={})
+        tx = dict(fence="hy2qianyi_" + "f" * 16, phase="publish", new=[asdict(self.main)],
+                  old=[dict(node=asdict(self.main), active=True, enabled=True, slots=[])],
+                  defaults="", main_subscription="", daily=plan)
+        with patch.multiple(q, TRAFFIC_PROGRAM=str(program), PREVIOUS_TRAFFIC_SHA256=q.sha(previous)):
+            for version in (q.LEGACY_JOURNAL_FORMAT, q.FORMAT):
+                with self.subTest(format=version):
+                    journal = dict(tx, format=version)
+                    if version == q.FORMAT:
+                        journal["target_tls"] = {}
+                    q.journal_write(journal)
+                    q.recover_target(self.host)
+                    self.assert_clean()
+
     def test_missing_target_daily_component_refuses_before_replacing_services(self):
         incoming = node("main", 443)
         record = dict(tag=incoming.tag, port=incoming.port, key=q.daily_key(incoming),
