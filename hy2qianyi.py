@@ -37,7 +37,7 @@ MAX_STATE_FILE = 1024 * 1024
 MAX_TLS_FILE = 64 * 1024
 SSH_FRAME = re.compile(rb"HY2SSH1 ([1-9][0-9]{0,8}) ([0-9a-f]{64})\n")
 MAX_SSH_PREAMBLE = 8192
-SOURCE_URL = "https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py"
+SOURCE_URL = "https://raw.githubusercontent.com/Promise55212/hy2qianyi/main/hy2qianyi.py"
 STATE = "/var/lib/hy2"
 LOCK_DIR = "/run/hy2"
 XRAY_DIR = "/etc/hysteria"
@@ -57,6 +57,7 @@ MAIN_DEFAULTS = "/etc/default/hy2-main"
 JOURNAL = f"{STATE}/.hy2qianyi-recovery.json"
 TRAFFIC_PROGRAM = "/usr/local/sbin/hy2_traffic"
 TRAFFIC_SHA256 = "ee047bbe398136de0effb1e626768e2dac078b74f0c185cffcb40c27f299caa3"
+CLASSIFIED_TRAFFIC_SHA256 = "d5193696ce49c4c6f73532869438b50ff9fc2510f356f2bbfad53bf665486306"
 PREVIOUS_TRAFFIC_SHA256 = "7fb3904d95d3b4e59f03662c7dbc107749380dc4422e8fba218b1631eb824de4"
 TRAFFIC_TABLE = "hy2_daily_traffic"
 TRAFFIC_UNITS = {
@@ -551,9 +552,14 @@ def validate_daily_records(records, nodes):
                 f"端口 {node.port} 的每日流量采样时间异常")
 
 
+def supported_traffic_digest(digest, *, recovering=False):
+    return (digest in (TRAFFIC_SHA256, CLASSIFIED_TRAFFIC_SHA256)
+            or (recovering and digest == PREVIOUS_TRAFFIC_SHA256))
+
+
 def validate_daily_payload(daily, nodes):
     require(isinstance(daily, dict) and set(daily) == {"program_sha256", "users"}
-            and daily["program_sha256"] == TRAFFIC_SHA256, "每日流量组件版本不支持")
+            and supported_traffic_digest(daily["program_sha256"]), "每日流量组件版本不支持")
     validate_daily_records(daily["users"], nodes)
 
 
@@ -564,7 +570,7 @@ def validate_daily_plan(plan, new, old):
     validate_daily_records(plan["incoming"], new)
     validate_daily_records(plan["before"], old)
     require(isinstance(plan["program"], str) and len(plan["program"]) <= MAX_STATE_FILE * 2
-            and sha(base64.b64decode(plan["program"], validate=True)) in {TRAFFIC_SHA256, PREVIOUS_TRAFFIC_SHA256},
+            and supported_traffic_digest(sha(base64.b64decode(plan["program"], validate=True)), recovering=True),
             "每日流量恢复程序校验失败")
 
 
@@ -925,9 +931,9 @@ add rule inet {table} outbound udp sport {{ {numbers} }} drop""")
         raise MigrationError("等待节点稳定监听超时，请查看目标机对应的 systemd 服务")
 
     def daily_module(self, program, *, recovering=False):
-        digest = sha(program)
-        require(digest == TRAFFIC_SHA256 or (recovering and digest == PREVIOUS_TRAFFIC_SHA256),
-                f"hy2_traffic 版本不支持，请先对齐原生统计组件（需要 SHA-256 {TRAFFIC_SHA256}）")
+        require(supported_traffic_digest(sha(program), recovering=recovering),
+                "hy2_traffic 版本不支持，请先对齐原生统计组件"
+                f"（支持 SHA-256 {CLASSIFIED_TRAFFIC_SHA256} 或 {TRAFFIC_SHA256}）")
         module = ModuleType("hy2qianyi_native_daily")
         module.__file__ = TRAFFIC_PROGRAM
         exec(compile(program, TRAFFIC_PROGRAM, "exec"), module.__dict__)
@@ -1444,12 +1450,13 @@ class GuardHost(Host):
         if not exists(TRAFFIC_PROGRAM):
             require(not exists(daily_path()), "源机缺少每日统计程序")
             return None
-        module = self.daily_module(secure_read(TRAFFIC_PROGRAM))
+        program = secure_read(TRAFFIC_PROGRAM)
+        module = self.daily_module(program)
         require(exists(daily_path()), "源机每日统计尚未采样，请等待原生定时器")
         secure_read(daily_path(), MAX_PACKET)
         state = module.load_state(daily_path())
         records = {n.tag: portable_daily(state["users"][n.tag]) for n in nodes if n.tag in state["users"]}
-        result = {"program_sha256": TRAFFIC_SHA256, "users": records}
+        result = {"program_sha256": sha(program), "users": records}
         validate_daily_payload(result, nodes)
         return result
 

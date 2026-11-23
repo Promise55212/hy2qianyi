@@ -14,7 +14,7 @@ if ($pythonHash -ne $Hy2QianyiPythonHash -or -not $readme.Contains($launcherHash
 }
 
 $bootstrap = [regex]::Match($readme, '(?ms)^```powershell\r?\n(?<script>.*?)^```\r?$').Groups['script'].Value
-$download = '$body = $client.DownloadData(''https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.ps1'')'
+$download = '$body = $client.DownloadData(''https://raw.githubusercontent.com/Promise55212/hy2qianyi/main/hy2qianyi.ps1'')'
 if (-not $bootstrap.Contains($download)) { throw 'Could not locate the README launcher download.' }
 # Feed the released bytes, including the BOM, through the same README bootstrap.
 $offlineBootstrap = $bootstrap.Replace($download, '$body = [IO.File]::ReadAllBytes($launcherPath)')

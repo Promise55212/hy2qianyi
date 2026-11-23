@@ -1,6 +1,6 @@
 # hy2qianyi
 
-[hy2jieshu](https://github.com/liucong552-art/hy2jieshu) 的双 VPS 轮换迁移工具，沿用 [qianyi](https://github.com/liucong552-art/qianyi) 的临时运行、SSH 传输和目标事务恢复方式。仅支持 HY2，不接收 VLESS 的迁移包。
+[hy2jieshu](https://github.com/Promise55212/hy2jieshu) 的双 VPS 轮换迁移工具，沿用 [qianyi](https://github.com/Promise55212/qianyi) 的临时运行、SSH 传输和目标事务恢复方式。仅支持 HY2，不接收 VLESS 的迁移包。
 
 **只负责迁移，不安装常驻迁移程序。** 目标接管源机的 UDP 443 主节点及全部未到期的普通、WG-NAT 临时节点。同端口以源机为准，目标机独有的节点保留。成功后删除本轮迁移工具、传输材料和临时防护，仅保留迁入的业务数据。源机保持运行，验证成功后由你切 DNS、自行重装旧机。
 
@@ -11,7 +11,9 @@
 - **WG-NAT 复用目标机已有的同名 WG 接口及独立 Peer**。先按 hy2jieshu 的 vpswg.sh / natjichang.sh 配置目标出口并建立一个目标 NAT 节点，验证握手、fail-closed 定时保护和 oif 策略路由。工具会采用目标 mark、table、优先级，不修改 NAT 出口机，不会把源机 WG 私钥复制过去。源、目标共用同一 Peer 会引起出口切换，应使用不同 Peer。
 - 迁入端口如有 TCP 业务、未知 UDP 监听、自定义 unit/drop-in、独立 portbw 或暂停策略，会在替换前拒绝。portbw 需另行按其管理流程配置，不会自动移植 tc/qdisc。
 - 有 HY2 手工黑名单时，目标需先安装同版本 hy2-guard。支持 IPv4/IPv6 CIDR，合并并保留目标原有黑名单和其他端口状态；不支持手工修改本项目拥有的 nft 表。
-- 原生 hy2_traffic 为可选组件。源已有统计时，源和目标都须通过 hy2jieshu 的原生流程预先安装 [新版 `traffic.py`（`43c7c7d`）](https://github.com/liucong552-art/hy2jieshu/blob/43c7c7df729bc6e71de734eb83a6960db8de7aac/traffic.py)，并用 `sha256sum /usr/local/sbin/hy2_traffic` 核对 `ee047bbe398136de0effb1e626768e2dac078b74f0c185cffcb40c27f299caa3`。导出读取原生分钟定时器的最新持久采样。缺少组件或版本不符时，预检在替换业务前停止。
+- 原生 hy2_traffic 为可选组件。源已有统计时，源和目标都须通过 hy2jieshu 的原生流程预先安装统计组件。用 `sha256sum /usr/local/sbin/hy2_traffic` 核对当前支持的版本。导出读取原生分钟定时器的最新持久采样。缺少组件或版本不符时，预检在替换业务前停止。
+  - [`traffic.py`（`1d16b21`）](https://github.com/Promise55212/hy2jieshu/blob/1d16b2145db4e7132a0a91fba27558fba3dc8c67/traffic.py)，SHA-256 `d5193696ce49c4c6f73532869438b50ff9fc2510f356f2bbfad53bf665486306`。
+  - [`traffic.py`（`43c7c7d`）](https://github.com/Promise55212/hy2jieshu/blob/43c7c7df729bc6e71de734eb83a6960db8de7aac/traffic.py)，SHA-256 `ee047bbe398136de0effb1e626768e2dac078b74f0c185cffcb40c27f299caa3`。
 
 ## Windows 一键迁移
 
@@ -25,9 +27,9 @@
     $previousTls = [Net.ServicePointManager]::SecurityProtocol
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $body = $client.DownloadData('https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.ps1')
+        $body = $client.DownloadData('https://raw.githubusercontent.com/Promise55212/hy2qianyi/main/hy2qianyi.ps1')
         $hash = ([BitConverter]::ToString($sha256.ComputeHash($body))).Replace('-', '').ToLowerInvariant()
-        if ($hash -ne '2820ee454a030263ead4916137ac71f0b618a128f0a049c8c4880524dc3cd24f') { throw '启动脚本校验失败，请重新打开 README 获取最新命令。' }
+        if ($hash -ne '0ceabe0b66874c72907c114b98adcbed6b9da80db474a38d7dde3c07bfcddb82') { throw '启动脚本校验失败，请重新打开 README 获取最新命令。' }
     }
     finally {
         [Net.ServicePointManager]::SecurityProtocol = $previousTls
@@ -55,8 +57,8 @@
   trap 'exit 143' TERM
   trap 'exit 129' HUP
   curl --proto '=https' -fsSL --max-time 90 \
-    https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
-  printf '%s  %s\n' 'a4b9b5a434178af7cfce696165d4dba8ea6febb54e0fd4a8e33c73a78fe660cb' "$d/hy2qianyi.py" | sha256sum -c -
+    https://raw.githubusercontent.com/Promise55212/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
+  printf '%s  %s\n' '75979f4853cb788185afbec70abfbc6267a995f139db2c1ed8b9ed8d7880ea90' "$d/hy2qianyi.py" | sha256sum -c -
   python3 -I -B "$d/hy2qianyi.py" send
 )
 ```

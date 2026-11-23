@@ -586,7 +586,8 @@ class TransactionTests(unittest.TestCase):
         before = path.read_bytes(), path.stat().st_mtime_ns
         module = SimpleNamespace(load_state=Mock(side_effect=lambda source: q.decode_json(Path(source).read_bytes())),
                                  collect=Mock(side_effect=AssertionError("must not collect source traffic")))
-        with patch.object(q, "TRAFFIC_PROGRAM", str(program)), \
+        published_hash = q.sha(b"fixture program")
+        with patch.multiple(q, TRAFFIC_PROGRAM=str(program), CLASSIFIED_TRAFFIC_SHA256=published_hash), \
                 patch.object(self.host, "daily_module", return_value=module), \
                 patch.object(self.host, "collect_daily", side_effect=AssertionError("must not collect source traffic")), \
                 patch.object(self.host, "run", side_effect=AssertionError("must not invoke source commands")), \
@@ -594,7 +595,7 @@ class TransactionTests(unittest.TestCase):
             result = q.Host.source_daily(self.host, [self.old])
         module.load_state.assert_called_once_with(path)
         module.collect.assert_not_called()
-        self.assertEqual(result, {"program_sha256": q.TRAFFIC_SHA256,
+        self.assertEqual(result, {"program_sha256": published_hash,
                                   "users": {self.old.tag: q.portable_daily(record)}})
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         self.assertNotIn("last", result["users"][self.old.tag])
@@ -731,6 +732,32 @@ class ValidationTests(unittest.TestCase):
         raw["format"] = 1 if q.FORMAT != 1 else "vless"
         with self.assertRaises(q.MigrationError):
             q.decode_bundle(q.encode_json(raw))
+
+    def test_daily_program_hashes_are_allowlisted_for_migration_and_recovery(self):
+        original = b"release = 'original'\n"
+        classified = b"release = 'classified'\n"
+        retired = b"release = 'retired'\n"
+        unknown = b"raise AssertionError('unknown program must not run')\n"
+        host = q.Host(Path("/run"))
+        with patch.multiple(q, TRAFFIC_SHA256=q.sha(original),
+                            CLASSIFIED_TRAFFIC_SHA256=q.sha(classified),
+                            PREVIOUS_TRAFFIC_SHA256=q.sha(retired)):
+            for program, release in ((original, "original"), (classified, "classified")):
+                q.validate_daily_payload({"program_sha256": q.sha(program), "users": {}}, [])
+                self.assertEqual(host.daily_module(program).release, release)
+            with self.assertRaises(q.MigrationError):
+                q.validate_daily_payload({"program_sha256": q.sha(retired), "users": {}}, [])
+            with self.assertRaises(q.MigrationError):
+                host.daily_module(retired)
+            self.assertEqual(host.daily_module(retired, recovering=True).release, "retired")
+
+            recovery = dict(install=False, directory_created=False, incoming={}, before={})
+            for program in (original, classified, retired):
+                q.validate_daily_plan(dict(recovery, program=base64.b64encode(program).decode()), [], [])
+            with self.assertRaises(q.MigrationError):
+                q.validate_daily_plan(dict(recovery, program=base64.b64encode(unknown).decode()), [], [])
+            with self.assertRaises(q.MigrationError):
+                host.daily_module(unknown, recovering=True)
 
     def test_udp_fence_uses_only_selected_ports(self):
         host = q.Host(Path("/run"))

@@ -1,6 +1,6 @@
 ﻿# Windows PowerShell 5.1 and later. Credentials stay in the local SSH client.
 $ErrorActionPreference = 'Stop'
-$Hy2QianyiPythonHash = 'a4b9b5a434178af7cfce696165d4dba8ea6febb54e0fd4a8e33c73a78fe660cb'
+$Hy2QianyiPythonHash = '75979f4853cb788185afbec70abfbc6267a995f139db2c1ed8b9ed8d7880ea90'
 $Hy2QianyiFrameLimit = 32MB + 8192 + 128
 $Hy2QianyiLinuxBootstrap = @'
 set -eu
@@ -10,7 +10,7 @@ trap 'rm -rf -- "$d"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
-curl --proto '=https' -fsSL --max-time 90 https://raw.githubusercontent.com/liucong552-art/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
+curl --proto '=https' -fsSL --max-time 90 https://raw.githubusercontent.com/Promise55212/hy2qianyi/main/hy2qianyi.py -o "$d/hy2qianyi.py"
 printf '%s  %s\n' "$1" "$d/hy2qianyi.py" | sha256sum -c - >/dev/null
 python3 -I -B "$d/hy2qianyi.py" "$2"
 '@
